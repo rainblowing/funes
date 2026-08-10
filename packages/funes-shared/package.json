@@ -1,0 +1,11 @@
+{
+  "name": "funes-shared",
+  "version": "0.0.1",
+  "description": "Node-side seams shared by the funes engine and its storage backends: index generation, zone classification, cross-process write locks. Depends only on funes-core + node builtins — never on a backend, so the package DAG stays acyclic.",
+  "type": "module",
+  "module": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": { "funes-core": "workspace:*" },
+  "license": "MIT"
+}

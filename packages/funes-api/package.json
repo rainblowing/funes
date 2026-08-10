@@ -1,0 +1,15 @@
+{
+  "name": "funes-api",
+  "version": "0.0.1",
+  "description": "Runtime-agnostic Hono spine over the funes op-registry (S5). The daemon (and later the Astro surface) host this app; all funes deps are INJECTED (dispatch/toolDefs/consoleHtml), so this package imports only hono — no PGLite, no node:fs, no Bun.* — keeping the HTTP contract one source of truth across hosts.",
+  "type": "module",
+  "module": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "hono": "^4"
+  },
+  "license": "MIT"
+}
