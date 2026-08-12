@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+*.sqlite
+*.sqlite.new
+.funes-tmp/
+.funes/
+dist-pkg/
+# The public-projection staging tree. Ignored for the same reason as dist-pkg, but it matters
+# more: --push runs `bun install` inside it to verify the projected tree, so it carries a full
+# node_modules (~600MB) that a stray `git add -A` would try to commit into the private vault.
+dist-public/
