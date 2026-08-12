@@ -1,0 +1,334 @@
+{
+  "_comment": "FROZEN advertised-contract snapshot. Regenerating this file IS a contract change to every MCP client and to twinkling — do it in its own commit whose diff is the release note. Regenerate with `bun run scripts/freeze-ops-contract.ts`.",
+  "operations": [
+    {
+      "name": "recall",
+      "internal": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "free-text question"
+          },
+          "k": {
+            "type": "number",
+            "description": "max results (default 5)"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "page",
+      "internal": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "vault-relative path, e.g. yachts/research.md"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "tree",
+      "internal": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dir": {
+            "type": "string",
+            "description": "vault-relative folder (default: vault root)"
+          }
+        }
+      }
+    },
+    {
+      "name": "neighbors",
+      "internal": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "node id (vault-relative path without .md)"
+          },
+          "k": {
+            "type": "number",
+            "description": "nearest neighbors to return (default 8, max 25)"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "graph",
+      "internal": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "health",
+      "internal": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "hotlist",
+      "internal": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "n": {
+            "type": "number",
+            "description": "max rows (default 20, max 100)"
+          }
+        }
+      }
+    },
+    {
+      "name": "indexed_page",
+      "internal": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "node id (vault-relative path without .md)"
+          },
+          "path": {
+            "type": "string",
+            "description": "vault-relative path (with or without .md)"
+          }
+        }
+      }
+    },
+    {
+      "name": "guarded_recall",
+      "internal": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "free-text question"
+          },
+          "k": {
+            "type": "number",
+            "description": "max results (default 5)"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "guarded_indexed_page",
+      "internal": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "node id (vault-relative path without .md)"
+          },
+          "path": {
+            "type": "string",
+            "description": "vault-relative path (with or without .md)"
+          }
+        }
+      }
+    },
+    {
+      "name": "remember",
+      "internal": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "short title"
+          },
+          "body": {
+            "type": "string",
+            "description": "the memory content (markdown)"
+          },
+          "type": {
+            "type": "string",
+            "description": "optional item type (default: memory)"
+          },
+          "tags": {
+            "type": "string",
+            "description": "optional comma-separated tags"
+          },
+          "volatile": {
+            "type": "boolean",
+            "description": "true if this is a STATE that later writes should replace (a rate, a plan); false/omitted for an EVENT, which is append-only and never goes stale"
+          },
+          "as_of": {
+            "type": "string",
+            "description": "when this was true (ISO date), if that differs from when it was written"
+          }
+        },
+        "required": [
+          "title",
+          "body"
+        ]
+      }
+    },
+    {
+      "name": "supersede",
+      "internal": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "oldId": {
+            "type": "string",
+            "description": "id of the item to supersede (out_memory/...)"
+          },
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "description": "optional item type"
+          },
+          "volatile": {
+            "type": "boolean",
+            "description": "true if the successor is still a STATE that later writes should replace"
+          },
+          "as_of": {
+            "type": "string",
+            "description": "when the successor's claim became true (ISO date)"
+          },
+          "tags": {
+            "type": "string",
+            "description": "optional comma-separated tags"
+          }
+        },
+        "required": [
+          "oldId",
+          "title",
+          "body"
+        ]
+      }
+    },
+    {
+      "name": "forget",
+      "internal": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "id of the item to forget (out_memory/...)"
+          },
+          "hard": {
+            "type": "boolean",
+            "description": "true = delete the markdown file (default false)"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  ],
+  "capabilities": [
+    {
+      "name": "forget",
+      "readonly": false,
+      "served": "fs",
+      "internal": false
+    },
+    {
+      "name": "graph",
+      "readonly": true,
+      "served": "fs",
+      "internal": false
+    },
+    {
+      "name": "guarded_indexed_page",
+      "readonly": true,
+      "served": "index",
+      "internal": true
+    },
+    {
+      "name": "guarded_recall",
+      "readonly": true,
+      "served": "index",
+      "internal": true
+    },
+    {
+      "name": "health",
+      "readonly": true,
+      "served": "index",
+      "internal": false
+    },
+    {
+      "name": "hotlist",
+      "readonly": true,
+      "served": "index",
+      "internal": false
+    },
+    {
+      "name": "indexed_page",
+      "readonly": true,
+      "served": "index",
+      "internal": false
+    },
+    {
+      "name": "neighbors",
+      "readonly": true,
+      "served": "fs",
+      "internal": false
+    },
+    {
+      "name": "page",
+      "readonly": true,
+      "served": "fs",
+      "internal": false
+    },
+    {
+      "name": "recall",
+      "readonly": true,
+      "served": "index",
+      "internal": false
+    },
+    {
+      "name": "remember",
+      "readonly": false,
+      "served": "fs",
+      "internal": false
+    },
+    {
+      "name": "supersede",
+      "readonly": false,
+      "served": "fs",
+      "internal": false
+    },
+    {
+      "name": "tree",
+      "readonly": true,
+      "served": "fs",
+      "internal": false
+    }
+  ]
+}

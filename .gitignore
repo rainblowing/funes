@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+*.sqlite
+*.sqlite.new
+.funes-tmp/
+.funes/
+dist-pkg/

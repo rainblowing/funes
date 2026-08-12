@@ -1,0 +1,19 @@
+{
+  "name": "funes",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "funes": "bun packages/funes-engine/src/cli.ts",
+    "lint:core": "bun scripts/lint-core-imports.ts",
+    "test": "bun run lint:core && bun run lint:dag && bun run typecheck && bun test --test-name-pattern \"^(?!.*E5 embedder|.*real cross-encoder)\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint:dag": "bun scripts/lint-package-dag.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}
