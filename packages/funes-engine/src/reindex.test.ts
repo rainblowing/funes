@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Embedder, MemoryItem } from "funes-core";
+import type { Embedder, FinalizeReindex, MemoryItem, Store } from "funes-core";
 import { parseFrontmatter, fileToItem } from "./markdown.ts";
 import { indexDir, buildBasenameMap, resolveEdgeTargets, walkMd } from "./reindex.ts";
 import { LibsqlStore } from "../../funes-libsql/src/index.ts";
@@ -238,4 +238,28 @@ test("H2 invalidation: valid scoped rebuild -> delete manifest -> configless reb
   expect(await store.indexedPage({ id: "secret/s" })).toBeNull();      // excluded again
   expect(scopeRefusalReason(await store.getScopeSignature(), expected)).toBeNull(); // boundary holds
   await store.close();
+});
+
+test("full reindex: a Store with NO stats() still gets its dirty marker CLEARED (finalizeReindex is the only verb that clears it)", async () => {
+  // funes-core's `Store` makes `stats()` no part of the contract, and its reindex-lifecycle note says
+  // a store implementing `beginReindex` MUST implement `finalizeReindex` — since endReindex was
+  // retired, nothing else clears `reindex_dirty`. So THIS store is contract-COMPLIANT; while the
+  // finalization was gated on `stats()` as well, it set the marker at the start of every full run and
+  // never cleared it, leaving the index permanently mid-build and every later open refused.
+  const root = mkdtempSync(join(tmpdir(), "funes-nostats-"));
+  writeFileSync(join(root, "a.md"), "---\ntitle: A\n---\nalpha body\n");
+  let dirty = false;
+  let finalized: FinalizeReindex | undefined;
+  const store: Store = {
+    async remember(items: MemoryItem[]) { return { indexed: items.length, skipped: 0 }; },
+    async recall() { return []; },
+    async remove() { return 0; },
+    async prune() { return 0; },
+    async beginReindex() { dirty = true; },
+    async finalizeReindex(f: FinalizeReindex) { dirty = false; finalized = f; },
+  };
+  await indexDir(store, root, root, { scopeSignature: { hash: "scope-a", ignoreScope: false } });
+  expect(dirty).toBe(false);                                                // cleared, not left set
+  expect(finalized?.contentGeneration).toMatch(/^v2:[0-9a-f]{64}$/);         // the full run still stamps
+  expect(finalized?.scope).toEqual({ hash: "scope-a", ignoreScope: false }); // and still advances the built scope
 });

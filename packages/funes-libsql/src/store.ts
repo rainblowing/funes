@@ -15,13 +15,14 @@ import Graph from "graphology";
 import { circular } from "graphology-layout";
 import forceAtlas2 from "graphology-layout-forceatlas2";
 import louvain from "graphology-communities-louvain";
-import type { Embedder, MemoryItem, RecallQuery, RecallResult, RememberResult, ScopeSignature, Trust } from "funes-core";
-import { rrf, rrfScores, DEFAULT_RRF_K, resolveGraphArm, embeddingSignature, normalizeRelationType, buildGraphArm, GRAPH_ARM_CAP_OUT, GRAPH_ARM_CAP_IN, GRAPH_ARM_HUB_MAX } from "funes-core";
+import type { Embedder, FinalizeReindex, MemoryItem, RecallQuery, RecallResult, RememberResult, ScopeSignature, Trust } from "funes-core";
+import { rrf, rrfScores, resolveGraphArm, embeddingSignature, normalizeRelationType, buildGraphArm, GRAPH_ARM_CAP_OUT, GRAPH_ARM_CAP_IN, GRAPH_ARM_HUB_MAX } from "funes-core";
 import type { GraphNeighborRow } from "funes-core";
-import { acquireWriteLock, withWriteLock } from "funes-shared";
+import { acquireWriteLock, withWriteLock, resolveRrfK, servingSignature } from "funes-shared";
 import type { WriteLock } from "funes-shared";
 import { CHUNK_SIG, chunkText } from "funes-core";
-import { INDEX_SCHEMA_VERSION } from "funes-shared";
+import { INDEX_SCHEMA_VERSION, GENERATION_VERSION } from "funes-shared";
+import { randomUUID } from "node:crypto";
 
 // P2.10: fts5 bm25 column weights over (nid, title, description, body). fts5 bm25() is lower=better,
 // and a higher weight makes matches in that column dominate the score — so a query term that hits a
@@ -32,14 +33,26 @@ const BM25_TITLE_WEIGHT = 10.0;
 const BM25_DESC_WEIGHT = 3.0;
 const BM25_BODY_WEIGHT = 1.0;
 import { zoneOfFile } from "funes-shared";
-import { guardRefusal } from "funes-core";
+import { expectationRefusal } from "funes-core";
+import type { ScopeExpectation } from "funes-core";
 import type { Reranker } from "funes-core";
-import type { HotlistRow, IndexedPage, GraphArtifact, GraphNode, GraphEdge, NeighborsResult, GuardedResult, FunesIndexStore } from "funes-core";
+import type { HotlistRow, IndexedPage, GraphArtifact, GraphAuditRows, GraphNode, GraphEdge, NeighborsResult, GuardedResult, FunesIndexStore, ContentIdentity, IndexStats } from "funes-core";
 import {
   hashItem, isVolatile, freshnessEpoch, authoredEpoch, RRF_TIE_EPS, recencyTiebreak, trustAdjust, zoneAdjust, entityAdjust, collapseDuplicates,
 } from "./ranking.ts";
 
 type DB = InstanceType<typeof Database>; // libsql's default export is a constructor + namespace
+
+/** The `nodes` columns a hash-skipped remember() reads back: the content hash it compares, plus
+ *  EVERY generation-participating column. The columns are the EVIDENCE item 11 runs on — the
+ *  metadata-sync UPDATE's own `changes` count cannot say whether it moved a served row or only
+ *  stamped `write_actor` (advisory, deliberately outside the content generation), because its
+ *  WHERE clause covers both. Comparing here answers exactly that question. */
+type SyncRow = {
+  id: string; content_hash: string | null; type: string | null; trust: string;
+  volatile: number; freshness: number | null; description: string | null; resource: string | null;
+  source: string | null; authored: number | null;
+};
 
 // MIRROR of funes-engine/src/store.ts graph-bake helpers — kept in sync so both backends lay out
 // constellations identically (the forceAtlas2/louvain params below are load-bearing for that).
@@ -52,7 +65,9 @@ const RELATION_FAMILIES: Record<string, string[]> = {
 };
 // N4 (2026-07-13, mirror of pglite): auto-derived types get explicit "structural" entries
 // (status quo made deliberate); lookups normalize spelling — storage keeps authored strings.
-const TYPE_TO_FAMILY: Record<string, string> = { "related-to": "structural", mentions: "structural" };
+// `references` joins them (2026-08-22, serena `mem:` extraction): a cross-reference between two
+// memories is associative like `related-to`, not evidential like `cites`.
+const TYPE_TO_FAMILY: Record<string, string> = { "related-to": "structural", mentions: "structural", references: "structural" };
 for (const fam in RELATION_FAMILIES) for (const t of RELATION_FAMILIES[fam]!) TYPE_TO_FAMILY[t] = fam;
 const familyOf = (type: string): string => TYPE_TO_FAMILY[normalizeRelationType(type)] ?? "structural";
 function seededRng(seed: number): () => number {
@@ -72,6 +87,10 @@ const roUri = (p: string): string => `file:${p.replace(/[%?#]/g, (c) => `%${c.ch
 // F3: a brief writer lock (a broker mid-remember, a publisher finalizing) makes a reader WAIT this
 // long rather than surface SQLITE_BUSY as a 500 — set on BOTH RW and RO opens.
 const BUSY_TIMEOUT_MS = 5_000;
+/** The schema versions a READ-ONLY open serves (PLAN-0.3.0 rollout step 30, dual-read): the current
+ *  one, plus "3" — the 0.2.x layout, which "4" fenced without changing a row. The read-write open
+ *  accepts only INDEX_SCHEMA_VERSION; see init(). */
+const READ_COMPAT_SCHEMA_VERSIONS: ReadonlySet<string> = new Set(["3", INDEX_SCHEMA_VERSION]);
 
 export class LibsqlStore implements FunesIndexStore {
   // P3.15: explicit fields, not TS parameter properties — non-erasable syntax that Node's
@@ -153,7 +172,15 @@ export class LibsqlStore implements FunesIndexStore {
       if (isNewDb) db.exec("PRAGMA journal_mode=WAL;"); // multi-process safe (local FS) — new dbs only
     }
     const s = new LibsqlStore(db, embedder, `${embeddingSignature(embedder)}:${CHUNK_SIG}`, opts.reranker, opts.trackRecalls ?? false, dbPath, false, opts.writeActor ?? "unknown");
-    s.init(opts.allowDirty ?? false);
+    try {
+      s.init(opts.allowDirty ?? false);
+    } catch (e) {
+      // F9's rule, on the WRITER path too: a refused open must not leak the native handle. The
+      // schema fence made a read-write refusal a ROLLOUT event (a broker resolving per op against a
+      // not-yet-republished "3" home), and a leaked fd per retry is how that becomes an outage.
+      db.close();
+      throw e;
+    }
     return s;
   }
 
@@ -181,10 +208,13 @@ export class LibsqlStore implements FunesIndexStore {
         `funes: embedding drift — index built with "${stored}" but embedder is "${this.sig}". Delete the index (its .funes dir) and reindex.`,
       );
     }
-    // P2.10: a RO handle can't migrate the fts schema — refuse an old/unknown one loudly (the writer
-    // side migrates on its next open; publish a fresh generation for a served read home).
+    // DUAL-READ (PLAN-0.3.0 rollout step 30): a v4 reader serves a "3" artefact as well as a "4" one,
+    // because "4" changed no row layout — it is the version fence (R2#2) — and the readers are
+    // deployed everywhere BEFORE any home is republished, so a read face on a not-yet-republished
+    // home must keep serving. Anything else is refused: pre-2 has a different fts shape, and a
+    // version this build has never seen is a newer build's artefact.
     const sv = (d.prepare("select value from meta where key='schema_version'").get() as { value: string } | undefined)?.value;
-    if (sv !== INDEX_SCHEMA_VERSION) {
+    if (sv == null || !READ_COMPAT_SCHEMA_VERSIONS.has(sv)) {
       throw new Error(`funes: index at ${dbPath} has schema_version "${sv ?? "1(pre-versioning)"}" != "${INDEX_SCHEMA_VERSION}" — rebuild/publish it on the WRITER side before serving read-only.`);
     }
     const dirty = (d.prepare("select value from meta where key='reindex_dirty'").get() as { value: string } | undefined)?.value;
@@ -216,18 +246,6 @@ export class LibsqlStore implements FunesIndexStore {
     return res ? withWriteLock(res, fn) : fn();
   }
 
-  /** P2.10: rebuild the fts5 table as the weighted 4-column schema, repopulated from the `nodes`
-   *  table (which already carries title/description/body) — so a pre-2 index migrates WITHOUT
-   *  re-embedding. Idempotent enough: it drops + recreates + refills in one exec. */
-  private migrateFtsToV2(): void {
-    this.db.exec(`
-      drop table if exists nodes_fts;
-      create virtual table nodes_fts using fts5(nid unindexed, title, description, body, tokenize='unicode61');
-      insert into nodes_fts(nid,title,description,body)
-        select id, title, coalesce(description,''), body from nodes;
-    `);
-  }
-
   private init(allowDirty: boolean): void {
     const d = this.db;
     d.exec(`
@@ -255,6 +273,15 @@ export class LibsqlStore implements FunesIndexStore {
       d.exec(`create table if not exists recall_stats(
         memory_id text primary key, hit_count integer not null default 0, last_recalled text);`);
     }
+    // PLAN-0.3.0 item 15/17: a RANDOM instance id, once, inside the database. Machine-local state
+    // binds to `publicationId ?? instanceId`; binding to a PATH hash is the trap — the path is
+    // unchanged when a different database replaces the file at it (a publish swap, a restored
+    // backup, a copied index), so a path-keyed "authored here" marker survives a substitution it
+    // should have failed. Stamped for EXISTING databases too, not only fresh ones: a pre-0.3.0
+    // index otherwise has nothing to bind to for the rest of its life.
+    if (!(this.db.prepare("select value from meta where key='instance_id'").get() as { value: string } | undefined)?.value) {
+      d.prepare("insert into meta(key,value) values ('instance_id',?)").run(randomUUID());
+    }
     // embedding drift guard (H1): a DIFFERENT stored signature is a hard stop; absent is grandfathered.
     const stored = (d.prepare("select value from meta where key='embedding_signature'").get() as { value: string } | undefined)?.value;
     if (stored && stored !== this.sig) {
@@ -265,29 +292,22 @@ export class LibsqlStore implements FunesIndexStore {
     if (!stored) {
       d.prepare("insert into meta(key,value) values ('embedding_signature',?) on conflict(key) do update set value=excluded.value").run(this.sig);
     }
-    // P2.10 schema-version guard (Codex R2#4): the fts5 table schema is versioned in meta. A FRESH
-    // index (no embedding sig yet) stamps the current version below. A BUILT index whose schema is
-    // OLD is either MIGRATED (the pre-2 single-column fts5 → the weighted 4-column one, rebuilt from
-    // the nodes table's title/description/body — NO re-embed) or, for an RO handle or an unknown
-    // version, REFUSED loudly. `if not exists` above left an old fts table intact, so migrate drops it.
+    // Schema-version FENCE (Codex R2#4 gave it the meta row; PLAN-0.3.0 R2#2 made it a fence). A
+    // FRESH index (no embedding sig yet) stamps the current version. A BUILT index is opened
+    // read-write ONLY at exactly the current version: the rollout matrix needs a v4 writer to
+    // refuse a v3 index (and a v3 writer, whose own check is exact-equality, to refuse a v4 one),
+    // and an in-place upgrade here would be the one thing that lets a stale index cross that line
+    // without the rebuild the matrix assumes. The old ladder (pre-2 fts rebuild, v2→v3 column adds)
+    // is retired with it: the refusal names the rebuild instead. `if not exists` above never
+    // touches an existing table, so a refused open has mutated nothing but the instance id.
     const storedSchema = (d.prepare("select value from meta where key='schema_version'").get() as { value: string } | undefined)?.value;
-    const stampSchema = () => d.prepare("insert into meta(key,value) values ('schema_version',?) on conflict(key) do update set value=excluded.value").run(INDEX_SCHEMA_VERSION);
     if (!stored) {
-      stampSchema(); // fresh index
+      d.prepare("insert into meta(key,value) values ('schema_version',?) on conflict(key) do update set value=excluded.value").run(INDEX_SCHEMA_VERSION); // fresh index
     } else if (storedSchema !== INDEX_SCHEMA_VERSION) {
-      // Migration ladder to the current version. Both known steps are additive on a writer open —
-      // pre-2 (null) ALSO needs the fts5 single→4-column rebuild (P2.10); v2→v3 (provenance-v1) needs
-      // only the source/authored/write_actor columns, added idempotently by the enrich block below.
-      // A read-only handle can't migrate; an unknown/newer version refuses loudly.
-      const migratable = storedSchema == null || storedSchema === "2";
-      if (!migratable) {
-        throw new Error(`funes: index schema_version "${storedSchema}" != "${INDEX_SCHEMA_VERSION}" at ${this.dataPath} — this build can't read it. Delete the index and reindex (or \`funes publish --force\` a served home).`);
-      }
-      if (this.ro) {
-        throw new Error(`funes: index schema is "${storedSchema ?? "pre-2"}" but this build serves "${INDEX_SCHEMA_VERSION}" at ${this.dataPath} — a READ-ONLY handle can't migrate it; run \`funes reindex\` (or restart the writer) to upgrade the schema first.`);
-      }
-      if (storedSchema == null) this.migrateFtsToV2(); // pre-2 fts rebuild; column adds happen below
-      stampSchema();
+      throw new Error(
+        `funes: index schema_version "${storedSchema ?? "pre-2"}" != "${INDEX_SCHEMA_VERSION}" at ${this.dataPath} — this build does not migrate in place (the version is a fence, PLAN-0.3.0 R2#2). ` +
+        "Rebuild it: `funes reindex --fresh` for a live index, `funes publish` for a served home.",
+      );
     }
     // H2 dirty-marker: an interrupted full reindex refuses normal opens.
     const dirty = (d.prepare("select value from meta where key='reindex_dirty'").get() as { value: string } | undefined)?.value;
@@ -318,15 +338,36 @@ export class LibsqlStore implements FunesIndexStore {
   async beginReindex(): Promise<void> {
     this.assertWritable();
     const res = this.lockResource;
-    if (res) this.reindexLock = await acquireWriteLock(res); // held until endReindex (or close-belt)
+    if (res) this.reindexLock = await acquireWriteLock(res); // held until finalizeReindex (or close-belt)
     this.db.prepare("insert into meta(key,value) values ('reindex_dirty','1') on conflict(key) do update set value='1'").run();
   }
-  async endReindex(): Promise<void> {
+  /** PLAN-0.3.0 item 12 — the ONE atomic end of a full reindex. It replaced `endReindex()` +
+   *  `setGeneration()`, which were four independent statements in four implicit transactions:
+   *  clearing the stamp was atomic, SETTING it was not, so a crash between them left a generation
+   *  naming rows it had not finished building, or a clean-looking index carrying no stamp at all.
+   *  Everything the completed build establishes — the content generation, the cleared invalidation,
+   *  the built scope, the cleared dirty marker and the freshness timestamp — commits together.
+   *
+   *  The reindex lock is released AFTER the commit, never inside it: the lock exists to keep other
+   *  writers out until the transaction naming these rows is durable. */
+  async finalizeReindex(f: FinalizeReindex): Promise<void> {
     this.assertWritable(); // F7: RO handles refuse every mutating entry point, not just the locked() ones
-    // Freshness honesty (stack review B-4): stamp the completed full rebuild so surfaces can say
-    // "indexed <when>" instead of the misleading "index clean" (dirty only means not-interrupted).
-    this.db.prepare("insert into meta(key,value) values ('last_reindex_at',?) on conflict(key) do update set value=excluded.value").run(new Date().toISOString());
-    this.db.prepare("delete from meta where key='reindex_dirty'").run();
+    const tx = this.db.transaction(() => {
+      this.metaSet("generation", f.contentGeneration);
+      // The stamp and its invalidation are ONE fact in two keys — a fresh stamp with a stale
+      // `invalidated_at` beside it would read as invalid on the very build that repaired it.
+      this.metaDel("generation_invalidated_at");
+      this.metaDel("generation_invalidated_reason");
+      // Built scope, the same tri-state the separate set/clearScopeSignature calls carried: null
+      // CLEARS (a configless rebuild must not re-bless re-admitted files), undefined leaves.
+      if (f.scope === null) { this.metaDel("index_scope_hash"); this.metaDel("index_scope_ignored"); }
+      else if (f.scope) { this.metaSet("index_scope_hash", f.scope.hash); this.metaSet("index_scope_ignored", f.scope.ignoreScope ? "1" : "0"); }
+      // Freshness honesty (stack review B-4): stamp the completed full rebuild so surfaces can say
+      // "indexed <when>" instead of the misleading "index clean" (dirty only means not-interrupted).
+      this.metaSet("last_reindex_at", new Date().toISOString());
+      this.metaDel("reindex_dirty");
+    });
+    tx();
     this.reindexLock?.release();
     this.reindexLock = undefined;
   }
@@ -338,15 +379,14 @@ export class LibsqlStore implements FunesIndexStore {
   private async rememberUnlocked(items: MemoryItem[]): Promise<RememberResult> {
     const d = this.db;
     // incremental: skip items whose content hash already matches (no re-embed)
-    const existing = new Map<string, string>();
-    const existingDesc = new Map<string, string | null>();
+    const existing = new Map<string, SyncRow>();
     for (let i = 0; i < items.length; i += 400) {
       const slice = items.slice(i, i + 400);
-      const rows = d.prepare(`select id, content_hash, description from nodes where id in (${ph(slice.length)})`).all(...slice.map((x) => x.id)) as { id: string; content_hash: string | null; description: string | null }[];
-      for (const row of rows) { existing.set(row.id, row.content_hash ?? ""); existingDesc.set(row.id, row.description ?? null); }
+      const rows = d.prepare(`select id, content_hash, type, trust, volatile, freshness, description, resource, source, authored from nodes where id in (${ph(slice.length)})`).all(...slice.map((x) => x.id)) as SyncRow[];
+      for (const row of rows) existing.set(row.id, row);
     }
-    const changed = items.filter((it) => existing.get(it.id) !== hashItem(it));
-    const unchanged = items.filter((it) => existing.has(it.id) && existing.get(it.id) === hashItem(it));
+    const changed = items.filter((it) => (existing.get(it.id)?.content_hash ?? null) !== hashItem(it));
+    const unchanged = items.filter((it) => existing.has(it.id) && existing.get(it.id)!.content_hash === hashItem(it));
     // trust/volatile/freshness sync for hash-skipped rows (metadata-only, no re-embed)
     if (unchanged.length) {
       // provenance-v1: source/authored are declared metadata → synced here too (a source-only edit is
@@ -359,22 +399,37 @@ export class LibsqlStore implements FunesIndexStore {
       // real actors and is absent from canonical markdown, so it cannot be reconstructed if lost.
       // The upgrade path is an append-only mutation ledger; until then do not read it as an audit
       // trail (README says so explicitly).
-      const upd = d.prepare("update nodes set trust=?, volatile=?, freshness=?, description=?, resource=?, source=?, authored=?, write_actor=coalesce(nullif(?,'unknown'), write_actor) where id=? and (trust is not ? or volatile is not ? or freshness is not ? or description is not ? or resource is not ? or source is not ? or authored is not ? or write_actor is not coalesce(nullif(?,'unknown'), write_actor))");
+      // `type` joined this list with the content generation's v2 widening (PLAN-0.3.0 item 6): it is
+      // returned by indexed_page and now names the row's identity, yet a type-only frontmatter edit
+      // is hash-skipped — so before this it moved the generation while never reaching the row, and
+      // the rebuilt target could not match the built index.
+      const upd = d.prepare("update nodes set type=?, trust=?, volatile=?, freshness=?, description=?, resource=?, source=?, authored=?, write_actor=coalesce(nullif(?,'unknown'), write_actor) where id=? and (type is not ? or trust is not ? or volatile is not ? or freshness is not ? or description is not ? or resource is not ? or source is not ? or authored is not ? or write_actor is not coalesce(nullif(?,'unknown'), write_actor))");
       const delFtsU = d.prepare("delete from nodes_fts where nid=?");
       const insFtsU = d.prepare("insert into nodes_fts(nid,title,description,body) values (?,?,?,?)");
       const tx = d.transaction(() => {
+        let moved = 0; // rows whose GENERATION-participating columns actually changed (item 11)
         for (const it of unchanged) {
-          const tr = it.trust ?? "untrusted", vo = isVolatile(it) ? 1 : 0, fr = freshnessEpoch(it);
+          const ty = it.type ?? null, tr = it.trust ?? "untrusted", vo = isVolatile(it) ? 1 : 0, fr = freshnessEpoch(it);
           const de = it.description ?? null, re = it.resource ?? null;
           const so = it.source ?? null, au = authoredEpoch(it), wa = this.writeActor;
-          upd.run(tr, vo, fr, de, re, so, au, wa, it.id, tr, vo, fr, de, re, so, au, wa);
+          const was = existing.get(it.id)!;
+          // The evidence, column by column — deliberately NOT `upd.changes`: that counts a
+          // write_actor-only stamp too, and invalidating on one would force a manual republish for
+          // a change no reader can observe (Codex R4#9).
+          if (was.type !== ty || was.trust !== tr || was.volatile !== vo || was.freshness !== fr
+            || was.description !== de || was.resource !== re || was.source !== so || was.authored !== au) moved++;
+          upd.run(ty, tr, vo, fr, de, re, so, au, wa, it.id, ty, tr, vo, fr, de, re, so, au, wa);
           // description folds into FTS — refresh the FTS row when it changed on a hash-skipped item,
           // else a description-only edit isn't searchable until the body next changes (Codex #1).
-          if ((existingDesc.get(it.id) ?? null) !== de) {
+          if (was.description !== de) {
             delFtsU.run(it.id);
             insFtsU.run(it.id, it.title, it.description ?? "", it.body);
           }
         }
+        // ATOMIC with the rows it describes (items 11 + 13): the invalidation and its reason commit
+        // in the SAME transaction as the update that caused them, so no crash can leave an index
+        // whose rows moved while its content generation still names the old ones.
+        if (moved) this.invalidateContentGeneration(`remember: metadata sync moved ${moved} row${moved === 1 ? "" : "s"}`);
       });
       tx();
     }
@@ -415,6 +470,9 @@ export class LibsqlStore implements FunesIndexStore {
         delEdges.run(it.id);
         for (const e of it.edges ?? []) insEdge.run(it.id, e.type, e.target, e.weight ?? 1.0);
       }
+      // Item 11: `changed` IS the evidence, by construction — every row here carries a new content
+      // hash, so the index no longer holds the rows the stamped content generation named.
+      this.invalidateContentGeneration(`remember: ${changed.length} page${changed.length === 1 ? "" : "s"} re-indexed`);
     });
     tx();
     return { indexed: changed.length, skipped: items.length - changed.length };
@@ -428,13 +486,20 @@ export class LibsqlStore implements FunesIndexStore {
     const d = this.db;
     let removed = 0;
     const tx = d.transaction(() => {
+      let touched = 0; // rows actually deleted across ALL four tables (item 11 evidence)
       for (let i = 0; i < ids.length; i += 400) {
         const s = ids.slice(i, i + 400);
-        removed += (d.prepare(`delete from nodes where id in (${ph(s.length)})`).run(...s).changes as number) ?? 0;
-        d.prepare(`delete from chunks where page_id in (${ph(s.length)})`).run(...s);
-        d.prepare(`delete from edges where source in (${ph(s.length)})`).run(...s);
-        d.prepare(`delete from nodes_fts where nid in (${ph(s.length)})`).run(...s);
+        const n = (d.prepare(`delete from nodes where id in (${ph(s.length)})`).run(...s).changes as number) ?? 0;
+        removed += n;
+        touched += n
+          + ((d.prepare(`delete from chunks where page_id in (${ph(s.length)})`).run(...s).changes as number) ?? 0)
+          + ((d.prepare(`delete from edges where source in (${ph(s.length)})`).run(...s).changes as number) ?? 0)
+          + ((d.prepare(`delete from nodes_fts where nid in (${ph(s.length)})`).run(...s).changes as number) ?? 0);
       }
+      // A remove that matched NOTHING — a stale id, a double-forget, a supersede of an unindexed
+      // page — changed no served row, so it must not cost the star a manual republish (item 11).
+      // All four tables count: a node-less orphan chunk or edge still moves what recall walks.
+      if (touched) this.invalidateContentGeneration(`remove: ${removed} page row${removed === 1 ? "" : "s"} deleted`);
     });
     tx();
     return removed;
@@ -452,9 +517,13 @@ export class LibsqlStore implements FunesIndexStore {
       const ins = d.prepare("insert or ignore into _keep(id) values (?)");
       for (const id of keepIds) ins.run(id);
       removed = (d.prepare("delete from nodes where id not in (select id from _keep)").run().changes as number) ?? 0;
-      d.prepare("delete from chunks where page_id not in (select id from _keep)").run();
-      d.prepare("delete from edges where source not in (select id from _keep)").run();
-      d.prepare("delete from nodes_fts where nid not in (select id from _keep)").run();
+      const touched = removed
+        + ((d.prepare("delete from chunks where page_id not in (select id from _keep)").run().changes as number) ?? 0)
+        + ((d.prepare("delete from edges where source not in (select id from _keep)").run().changes as number) ?? 0)
+        + ((d.prepare("delete from nodes_fts where nid not in (select id from _keep)").run().changes as number) ?? 0);
+      // A prune that deleted nothing is the common case — every clean-tree full reindex ends in
+      // one. It changed no served row, so it must not invalidate (item 11).
+      if (touched) this.invalidateContentGeneration(`prune: ${removed} stale page row${removed === 1 ? "" : "s"} deleted`);
     });
     tx();
     return removed;
@@ -563,8 +632,9 @@ export class LibsqlStore implements FunesIndexStore {
     // showed k=60 flattens fusion so much the weighted FTS arm couldn't move the fused top-k; k=5
     // won every metric on all three fixture sets (rrf.ts has the numbers). FUNES_RRF_K stays as the
     // measurement override for future sweeps. A non-finite value falls back to the default.
-    const kEnv = Number(process.env.FUNES_RRF_K);
-    const rrfK = Number.isFinite(kEnv) ? kEnv : DEFAULT_RRF_K;
+    // Resolved through funes-shared, not inline: the serving signature signs the value this process
+    // ACTUALLY fuses at, and a second copy of the normalization here could drift from it (item 7).
+    const rrfK = resolveRrfK(process.env);
     const scores = rrfScores([fts, vec, edges], rrfK);
     const merged = rrf([fts, vec, edges], rrfK, { tieBreakIds: v2 });
 
@@ -630,7 +700,7 @@ export class LibsqlStore implements FunesIndexStore {
     return results;
   }
 
-  async stats(): Promise<{ nodes: number; edges: number; embeddingSignature: string | null; reindexDirty: boolean; lastReindexAt: string | null; scopeHash: string | null; ignoreScope: boolean; generation: string | null }> {
+  async stats(): Promise<IndexStats> {
     const d = this.db;
     const n = (d.prepare("select count(*) as c from nodes").get() as { c: number }).c;
     const e = (d.prepare("select count(*) as c from edges").get() as { c: number }).c;
@@ -638,18 +708,117 @@ export class LibsqlStore implements FunesIndexStore {
     const dirty = (d.prepare("select value from meta where key='reindex_dirty'").get() as { value: string } | undefined)?.value === "1";
     const last = (d.prepare("select value from meta where key='last_reindex_at'").get() as { value: string } | undefined)?.value ?? null;
     const scope = await this.getScopeSignature();
-    return { nodes: Number(n), edges: Number(e), embeddingSignature: sig, reindexDirty: dirty, lastReindexAt: last, scopeHash: scope?.hash ?? null, ignoreScope: scope?.ignoreScope ?? false, generation: await this.getGeneration() };
+    return {
+      nodes: Number(n), edges: Number(e), embeddingSignature: sig, reindexDirty: dirty, lastReindexAt: last,
+      scopeHash: scope?.hash ?? null, ignoreScope: scope?.ignoreScope ?? false,
+      schemaVersion: this.metaGet("schema_version") ?? null, // item 20: what is stamped, not what we serve
+      ...(await this.contentIdentity()), // item 13: health reports WHY there is no content generation
+    };
   }
 
-  /** generation-v1 (R5#1): persist the content-generation stamp of the last FULL build — meta key
-   *  `generation`, advanced by reindex.ts exactly where the scope signature is (full runs only). */
-  async setGeneration(generation: string): Promise<void> {
+  /** Item 18: id-only enumeration — the deletion half of the freshness signal. One indexed column
+   *  scan; `auditGraph()` was the only enumeration on the interface and it drags every edge along,
+   *  which is why the five callers all left the argument undefined and deletions went unseen. */
+  async indexedIds(): Promise<string[]> {
+    return (this.db.prepare("select id from nodes").all() as { id: string }[]).map((r) => r.id);
+  }
+
+  /** Item 15/17: the random per-database instance id. Stamped on a WRITABLE open (init) and read
+   *  here; a read-only handle over a pre-stamp database honestly answers null rather than minting
+   *  an id that would not survive the process. */
+  async instanceId(): Promise<string | null> {
+    return this.metaGet("instance_id") ?? null;
+  }
+
+  /** Item 7/20: THIS process's serving signature. The store owns every input — the substrate, the
+   *  bm25 column weights it actually ranks with, and the reranker it was constructed with — so
+   *  computing it anywhere else would mean copying those and letting the copy drift. */
+  servingSignature(): string {
+    return servingSignature({
+      backend: "libsql",
+      // Column order, INCLUDING the unindexed `nid` at 0.0 — these are the literal arguments passed
+      // to fts5 bm25() below, so a tweak there moves the signature by itself.
+      bm25ColumnWeights: [0.0, BM25_TITLE_WEIGHT, BM25_DESC_WEIGHT, BM25_BODY_WEIGHT],
+      reranker: this.reranker ? (this.reranker.id ?? "unnamed-reranker") : null,
+    });
+  }
+
+  /** Step 24: the raw audit rows. No join to nodes and no type normalization — both would erase
+   *  exactly what the audit exists to count. Two full scans; `doctor` is an operator command run
+   *  against a published generation, not a serving path. */
+  async auditGraph(): Promise<GraphAuditRows> {
+    const d = this.db;
+    const nodeIds = (d.prepare("select id from nodes").all() as { id: string }[]).map((r) => r.id);
+    const edges = d.prepare("select source,type,target from edges").all() as { source: string; type: string; target: string }[];
+    return { nodeIds, edges };
+  }
+
+  // ── content identity (PLAN-0.3.0 item 8) — meta keys `publication_id`, `generation`,
+  // `generation_invalidated_at`, `generation_invalidated_reason` ───────────────────────────────
+  private metaGet(key: string): string | undefined {
+    return (this.db.prepare("select value from meta where key=?").get(key) as { value: string } | undefined)?.value;
+  }
+  private metaSet(key: string, value: string): void {
+    this.db.prepare("insert into meta(key,value) values (?,?) on conflict(key) do update set value=excluded.value").run(key, value);
+  }
+  private metaDel(key: string): void {
+    this.db.prepare("delete from meta where key=?").run(key);
+  }
+
+  /** What this database says it IS. See ContentIdentity (funes-core) for why it is two fields. */
+  async contentIdentity(): Promise<ContentIdentity> {
+    const stamped = this.metaGet("generation") ?? null;
+    // A LEGACY v1 stamp is INVALID, never reinterpreted (item 8; Codex R4#2). It was computed over
+    // a narrower field set AND incremental writes never cleared it, so reading it as a content
+    // generation would re-assert the exact lie this release exists to remove. Reported null —
+    // never thrown on: a v1 index must still open, serve, and reindex its way to a v2.
+    const valid = stamped != null && stamped.startsWith(`${GENERATION_VERSION}:`);
+    return {
+      publicationId: this.metaGet("publication_id") ?? null,
+      contentGeneration: valid ? stamped : null,
+      invalidatedAt: this.metaGet("generation_invalidated_at") ?? null,
+      invalidatedReason: this.metaGet("generation_invalidated_reason")
+        ?? (stamped != null && !valid ? `legacy ${stamped.split(":")[0]} stamp — not a content generation; reindex to establish one` : null),
+    };
+  }
+
+  /** IMMUTABLE (item 8): a database that quietly renamed itself would strand every principal ack
+   *  and retention decision bound to the old id. Re-stamping the same id is an idempotent retry. */
+  async setPublicationId(publicationId: string): Promise<void> {
+    this.assertWritable();
+    const existing = this.metaGet("publication_id");
+    if (existing != null && existing !== publicationId) {
+      throw new Error(`funes: publication id is immutable — ${this.dataPath ?? ":memory:"} already carries "${existing}", refusing to restamp it as "${publicationId}"`);
+    }
+    this.metaSet("publication_id", publicationId);
+  }
+
+  /** EVIDENCE-DRIVEN invalidation (item 11; Codex R4#9) — call ONLY from inside the caller's
+   *  transaction, and ONLY with proof that a generation-participating row actually moved. Blanket
+   *  invalidation is the cost bomb from the other end: a write_actor-only sync, a remove that
+   *  matches nothing, or a prune that deletes nothing would each force a manual republish (item
+   *  13: recovery is manual in 0.3.0) for a change that alters no served content.
+   *
+   *  Recorded only when there IS a stamp to kill, so `invalidatedAt` means "when the last valid
+   *  stamp died", not "the last time anything was written" — a mid-build index that never had one
+   *  stays cleanly null. */
+  private invalidateContentGeneration(reason: string): void {
+    if (this.metaGet("generation") == null) return;
+    this.metaDel("generation");
+    this.metaSet("generation_invalidated_at", new Date().toISOString());
+    this.metaSet("generation_invalidated_reason", reason);
+  }
+
+  /** The owning star's identity, INSIDE the db (meta key `owner_star_id`). Written by every full
+   *  build, read by twinkling's publication gate and by the hub. See the interface comment for why
+   *  the `owner-vault` marker is not enough: it authenticates the directory, not the bytes. */
+  async setOwnerStarId(starId: string): Promise<void> {
     this.assertWritable(); // F7
-    this.db.prepare("insert into meta(key,value) values ('generation',?) on conflict(key) do update set value=excluded.value").run(generation);
+    this.db.prepare("insert into meta(key,value) values ('owner_star_id',?) on conflict(key) do update set value=excluded.value").run(starId);
   }
 
-  async getGeneration(): Promise<string | null> {
-    return (this.db.prepare("select value from meta where key='generation'").get() as { value: string } | undefined)?.value ?? null;
+  async getOwnerStarId(): Promise<string | null> {
+    return (this.db.prepare("select value from meta where key='owner_star_id'").get() as { value: string } | undefined)?.value ?? null;
   }
 
   /** Persist the index_scope signature (closure sprint 3B) — meta keys `index_scope_hash` +
@@ -686,11 +855,14 @@ export class LibsqlStore implements FunesIndexStore {
   /** H9: atomic cross-star serve guard (mirrors funes-engine) — check-retrieve-RECHECK the
    *  {scope-signature, reindex-dirty} state so a reindex re-admitting excluded rows between the
    *  check and the retrieval can never be served. Never mtime-cached. */
-  async guardedRead<T>(expectedHash: string, retrieve: () => Promise<T>): Promise<GuardedResult<T>> {
-    const r1 = guardRefusal(this.scopeState(), expectedHash);
+  async guardedRead<T>(expected: () => ScopeExpectation, retrieve: () => Promise<T>): Promise<GuardedResult<T>> {
+    // Item 16: BOTH scopes are re-read on the second check. `expected()` is re-evaluated rather
+    // than captured, so a `star.yaml` that narrows DURING the retrieval refuses on the way out —
+    // the desired-scope half of the window the first version left open.
+    const r1 = expectationRefusal(this.scopeState(), expected());
     if (r1) return { refusal: r1 };
     const value = await retrieve();
-    const r2 = guardRefusal(this.scopeState(), expectedHash);
+    const r2 = expectationRefusal(this.scopeState(), expected());
     if (r2) return { refusal: r2 };
     return { ok: value };
   }

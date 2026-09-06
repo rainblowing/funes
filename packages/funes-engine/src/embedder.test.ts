@@ -1,5 +1,8 @@
 import { test, expect } from "bun:test";
-import { E5Embedder, E5_DIM, modelCacheDir } from "./embedder.ts";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { E5Embedder, E5_DIM, E5_MODEL, E5_REVISION, modelCacheDir, seedTokenizerProbe } from "./embedder.ts";
 
 const cos = (a: Float32Array, b: Float32Array) => {
   let s = 0;
@@ -28,7 +31,7 @@ test("E5 embedder: 384-dim, L2-normalized, EN + RU semantic order", async () => 
 
 // The model cache used to live inside the transformers.js package directory — measured at 152MB in
 // node_modules/.bun/@huggingface+transformers@4.2.0/…/.cache. Every `npm i -g @funes-tech/cli`
-// threw it away and the next run re-downloaded ~145MB over ~70s. A cache keyed to the install is
+// threw it away and the next run re-downloaded 135MB over ~70s. A cache keyed to the install is
 // not a cache. These run without touching the network, unlike the rest of this file.
 test("the model cache lives outside node_modules, so an upgrade does not discard it", () => {
   const prev = process.env.FUNES_MODEL_DIR;
@@ -48,4 +51,40 @@ test("FUNES_MODEL_DIR overrides it, so a locus can point at shared storage", () 
   process.env.FUNES_MODEL_DIR = "/mnt/models";
   try { expect(modelCacheDir()).toBe("/mnt/models"); }
   finally { if (prev === undefined) delete process.env.FUNES_MODEL_DIR; else process.env.FUNES_MODEL_DIR = prev; }
+});
+
+// The offline hard failure P1.1 exists to remove. transformers.js probes for tokenizer_config.json
+// at the UNPINNED key before it loads anything, and a pinned download only ever writes the pinned
+// one — so a fully warm 135MB cache still died with "pipeline loaded without a tokenizer" the moment
+// the network went away. The probe's path IS the contract, so these assert it literally.
+const cacheDir = () => mkdtempSync(join(tmpdir(), "funes-model-"));
+
+test("a pinned cache gets the unpinned tokenizer_config.json the pre-flight probe looks for", () => {
+  const cache = cacheDir();
+  mkdirSync(join(cache, E5_MODEL, E5_REVISION), { recursive: true });
+  writeFileSync(join(cache, E5_MODEL, E5_REVISION, "tokenizer_config.json"), '{"pinned":true}');
+
+  seedTokenizerProbe(cache, E5_MODEL, E5_REVISION);
+
+  // exactly where get_file_metadata(model, "tokenizer_config.json", {}) looks: no revision segment
+  expect(readFileSync(join(cache, E5_MODEL, "tokenizer_config.json"), "utf8")).toBe('{"pinned":true}');
+  rmSync(cache, { recursive: true, force: true });
+});
+
+test("seeding invents nothing: a cold cache stays cold and an existing copy is left alone", () => {
+  const cache = cacheDir();
+  mkdirSync(join(cache, E5_MODEL), { recursive: true });
+
+  // cold: nothing to copy from, so nothing is fabricated — the download still has to happen
+  seedTokenizerProbe(cache, E5_MODEL, E5_REVISION);
+  expect(existsSync(join(cache, E5_MODEL, "tokenizer_config.json"))).toBe(false);
+
+  // an unpinned load writes that key itself; it is that load's file, not ours to overwrite
+  writeFileSync(join(cache, E5_MODEL, "tokenizer_config.json"), "MAIN");
+  mkdirSync(join(cache, E5_MODEL, E5_REVISION), { recursive: true });
+  writeFileSync(join(cache, E5_MODEL, E5_REVISION, "tokenizer_config.json"), "PINNED");
+  seedTokenizerProbe(cache, E5_MODEL, "main"); // no-op: the probe's key is already the download's key
+  seedTokenizerProbe(cache, E5_MODEL, E5_REVISION);
+  expect(readFileSync(join(cache, E5_MODEL, "tokenizer_config.json"), "utf8")).toBe("MAIN");
+  rmSync(cache, { recursive: true, force: true });
 });

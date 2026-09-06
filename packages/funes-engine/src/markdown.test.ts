@@ -40,6 +40,42 @@ test("fileToItemWithMeta materializes sources:/people:/body wikilinks as edges (
   }
 });
 
+// The three producers added 2026-08-22 for the one-folder arrangement (serena beside funes, OKF as
+// the wire format). Each emits a REAL predicate with a resolvable target instead of another
+// `related-to`, and each covers a link shape the extractor previously read as prose.
+test("mem: refs, OKF object sources, and a local OKF resource become typed edges", () => {
+  const dir = mkdtempSync(join(tmpdir(), "funes-md-"));
+  try {
+    const f = join(dir, "concept.md");
+    writeFileSync(f, [
+      "---",
+      "title: Revenue",
+      "type: metric",
+      "resource: /computations/revenue.md",   // OKF §5.1 derivation edge
+      "sources:",
+      "  - { id: ga4-schema, resource: /tables/events.md }",  // OKF v0.2 object form
+      '  - "[[chat-a]]"',                                     // funes wikilink form, still works
+      "  - { id: vendor-docs, resource: https://example.com/x }", // external ⇒ no node, no edge
+      "---",
+      "Onboarding lives in `mem:auth/login`; see mem:core for the entry point.",
+      "A stale-after note[^ga4-schema] cites its source by footnote.",
+    ].join("\n"));
+    const { item } = fileToItemWithMeta(f, dir);
+    const set = new Set((item.edges ?? []).map((e) => `${e.type} ${e.target}`));
+    expect(set.has("derived-from computations/revenue")).toBe(true); // resource: -> derived-from
+    expect(set.has("cites tables/events")).toBe(true);               // OKF object source -> cites
+    expect(set.has("cites chat-a")).toBe(true);                      // wikilink source still cites
+    expect(set.has("references login")).toBe(true);                  // mem:auth/login -> last segment
+    expect(set.has("references core")).toBe(true);                   // bare mem:core
+    // An external URI is metadata, not a node: no edge may be invented for it.
+    expect([...set].some((s) => s.includes("example.com"))).toBe(false);
+    // The footnote is NOT a second edge — `sources` already emitted cites for that id.
+    expect((item.edges ?? []).filter((e) => e.type === "cites").length).toBe(2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a page with no links/edges still has no edges (undefined)", () => {
   const dir = mkdtempSync(join(tmpdir(), "funes-md-"));
   try {

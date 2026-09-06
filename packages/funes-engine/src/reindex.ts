@@ -1,10 +1,11 @@
 import { lstatSync, readdirSync, readFileSync } from "node:fs";
-import { basename, join, relative } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
 import type { MemoryItem, ScopeSignature, Store } from "funes-core";
 import { isTombstoned } from "funes-core";
 import { fileToItemWithMeta, parseFrontmatter } from "./markdown.ts";
 import { encodeGeneration, generationRecord, type GenerationRecord } from "funes-shared";
 import { withCoordination } from "./coordination.ts";
+import { anyExclude, buildScopeExclude, configlessExclude, readIndexScopeExcludes } from "./scope.ts";
 
 /** Walk options (vault-v2 brief, T1): `exclude` is an index-scope predicate over root-relative
  *  paths — called with `<relDir>/` (trailing slash) before descending into a directory (a true
@@ -15,18 +16,112 @@ export interface WalkOpts {
   exclude?: (rel: string) => boolean;
 }
 
+/** ONE walk answering both halves of "did the vault move under the index": is any surviving file
+ *  newer than `sinceMs`, and which ids does the vault still offer. Early-exits on the first newer
+ *  file, so the STALE case (the one that needs a warning) is cheap and the caller can skip the
+ *  index round-trip entirely — which is why `ids` is complete ONLY when `newer` is false, the
+ *  single case that reads it. The id is the one `fileToItemWithMeta` derives (rel path minus
+ *  `.md`), so it compares directly against index rows. */
+function scanCorpus(dir: string, sinceMs: number, opts: WalkOpts = {}): { newer: boolean; ids: Set<string> } {
+  const ids = new Set<string>();
+  for (const f of walkMd(dir, opts)) {
+    try { if (lstatSync(f).mtimeMs > sinceMs) return { newer: true, ids }; } catch { continue; } // vanished mid-walk
+    ids.add(relative(dir, f).replace(/\.md$/, ""));
+  }
+  return { newer: false, ids };
+}
+
 /** Is any indexable file under `dir` newer than `sinceMs`? Answers the only staleness question a
  *  user cares about — "did I change notes since the last reindex?" — instead of nagging about age,
- *  which fires on a vault nobody has touched.
- *
- *  Early-exits on the first newer file, so the STALE case (the one that needs a warning) is cheap;
- *  a clean vault costs one full stat walk. ponytail: no mtime cache — a 2,700-note walk is ~50ms
- *  and this runs once per CLI query, not per recall. Add a cache if a vault ever makes it hurt. */
+ *  which fires on a vault nobody has touched. Half the answer: see vaultChangedSince for deletions,
+ *  which leave no file behind to be newer. */
 export function vaultNewerThan(dir: string, sinceMs: number, opts: WalkOpts = {}): boolean {
-  for (const f of walkMd(dir, opts)) {
-    try { if (lstatSync(f).mtimeMs > sinceMs) return true; } catch { /* vanished mid-walk */ }
-  }
-  return false;
+  return scanCorpus(dir, sinceMs, opts).newer;
+}
+
+/** The corpus predicate a reindex actually applies, resolved from the vault's own manifest — so a
+ *  staleness check walks the SAME files the index covers. Without it, an edit to an
+ *  index_scope-excluded path (or any `.md` under `node_modules/` in a configless vault, which the
+ *  quickstart invites by pointing funes at a code repo) reports the index stale forever, and a
+ *  warning that cries wolf is one a reader learns to skip. An invalid manifest falls back to the
+ *  configless defaults instead of refusing the way reindex does: this answers an advisory question,
+ *  and it must never be the reason recall or health fails. */
+function indexedFileExclude(vault: string): ((rel: string) => boolean) | undefined {
+  const scope = readIndexScopeExcludes(vault);
+  return anyExclude(
+    buildScopeExclude(scope.kind === "valid" ? scope.excludes : []),
+    scope.kind === "valid" ? undefined : configlessExclude(),
+  );
+}
+
+const STALE_TTL_MS = 30_000;
+const staleMemo = new Map<string, { at: number; value: boolean | null }>();
+
+/** Has the vault changed since the last full reindex? `null` = unknown: no reindex stamp, or the
+ *  vault could not be walked. Never throws — a freshness hint must not be the reason a recall fails.
+ *
+ *  ADDITIONS and EDITS show up as an mtime newer than the stamp. DELETIONS do not — a note that is
+ *  gone leaves nothing behind to be newer, so an mtime-only walk answered "ok" for an index that
+ *  can still serve the deleted row, forever, which is the exact failure this signal exists to
+ *  catch. `indexedIds` closes it: the index's own id set IS the record of the corpus the last full
+ *  reindex covered, so nothing new has to be persisted to compare against. Optional — a store that
+ *  cannot enumerate (a test fake) keeps the mtime-only answer rather than degrading to `null`,
+ *  which would turn "I checked, and edits are invisible" into "I don't know" for every caller.
+ *
+ *  The comparison is ONE-directional on purpose — an indexed id with no file — and that is what
+ *  makes it noise-free: a tombstoned or index_scope-excluded file sits on disk with no index row
+ *  and must NOT count, while a brand-new file is an index row short and is already caught by its
+ *  mtime above. Narrowing index_scope without reindexing DOES now report changed: those rows are
+ *  live in recall and out of policy, which is a change worth naming.
+ *
+ *  Both accessors are thunks because each costs a store round-trip and this runs once per recall:
+ *  on a memo hit neither query nor the stat walk happens, and `indexedIds` is skipped entirely
+ *  whenever the walk already found a newer file.
+ *
+ *  ponytail: 30s TTL, one entry per vault. A clean walk of the 8.8k-file personal vault is
+ *  ~80-150ms and recall is the daemon's hot path, so an uncached check would tax every query. The
+ *  TTL cuts BOTH ways:
+ *    - it can hide an edit made in the last 30 seconds — advisory signal, acceptable; and
+ *    - it can keep serving a stale TRUE for up to 30 seconds AFTER a reindex, so the warning cries
+ *      wolf at the user who just did the thing it asked for. A full reindex in THIS process now
+ *      clears the entry (indexDir, on completion). A reindex in ANOTHER process — `funes reindex`
+ *      at a terminal while `funes mcp` answers — cannot, and stays bounded by the TTL alone.
+ *  Upgrade path for that last case: fold the reindex stamp into the memo key. Not taken, because
+ *  the key would then need a stats() round-trip on EVERY recall, which is the exact cost the thunks
+ *  below exist to avoid, to buy a 30s bound that is already there.
+ *  DECIDED (Codex R2 #17): health and the surface's freshness chip share this memo rather than
+ *  taking an uncached scan. The chip polls; an uncached health would hand a poller a full 8.8k-file
+ *  stat walk plus an id enumeration per refresh, to sharpen a signal whose own remedy (reindex)
+ *  takes minutes. 30s of lag in either direction is under the noise floor of the thing it reports.
+ *
+ *  Note for tests: the memo is module state keyed by vault path, so a test that reindexes and then
+ *  edits the SAME vault inside the window sees the cached answer — use a fresh temp vault per case. */
+export async function vaultChangedSince(
+  vault: string,
+  stampedAt: () => Promise<string | null>,
+  indexedIds?: () => Promise<string[] | null | undefined>,
+): Promise<boolean | null> {
+  const now = Date.now();
+  const key = resolve(vault); // so the reindex-side invalidation below can never silently miss
+  const hit = staleMemo.get(key);
+  if (hit && now - hit.at < STALE_TTL_MS) return hit.value;
+  let value: boolean | null = null;
+  try {
+    const at = Date.parse((await stampedAt()) ?? "");
+    if (!Number.isNaN(at)) {
+      const { newer, ids } = scanCorpus(vault, at, { exclude: indexedFileExclude(vault) });
+      value = newer || ((await indexedIds?.()) ?? []).some((id) => !ids.has(id));
+    }
+  } catch { /* unreadable vault or index — unknown, never a failure */ }
+  staleMemo.set(key, { at: now, value });
+  return value;
+}
+
+/** Drop a vault's memoized freshness answer. Called when a full reindex completes: that answer was
+ *  computed against the PREVIOUS reindex stamp, so keeping it tells the user their index is stale
+ *  for up to 30 more seconds after they already fixed it. Same-process only — module state. */
+export function forgetVaultFreshness(vault: string): void {
+  staleMemo.delete(resolve(vault));
 }
 
 /** Yield content `.md` files under a dir (skip dot-dirs, symlinks, index.md, *.summary.md). */
@@ -175,6 +270,14 @@ export async function indexDir(
      *  invalid manifest must not leave a stale clean signature the serve-time recompute could match.
      *  `undefined` leaves the prior signature as-is (no opinion). */
     scopeSignature?: ScopeSignature | null;
+    /** The owning star's identity (`star.yaml meta.id`), stamped into the database's `meta` table
+     *  on a FULL run — the same gate as the scope signature and the generation.
+     *
+     *  PASSED IN, never read from star.yaml here: reindex.ts is manifest-agnostic, and the caller
+     *  already holds the identity (the CLI from `readStarIdentity`, the publisher from its own
+     *  `starId` option). It is stamped at BUILD rather than at publish because the consumer is
+     *  twinkling's publication gate, and what that gate inspects is the built `index.db`. */
+    starId?: string;
   } = {},
 ): Promise<IndexResult> {
   // Cross-container coordination (re-homing plan item 12): a reindex is a funes WRITE path — when
@@ -194,6 +297,7 @@ async function indexDirInner(
     fresh?: boolean;
     exclude?: (rel: string) => boolean;
     scopeSignature?: ScopeSignature | null;
+    starId?: string;
   } = {},
 ): Promise<IndexResult> {
   const batchSize = opts.batch ?? 32;
@@ -241,24 +345,42 @@ async function indexDirInner(
   // file is gone or tombstoned. Skipped for a bounded run or a subdir reindex (would nuke the rest).
   if (full) {
     res.pruned = await store.prune(seen);
-    // Advance the index_scope signature only HERE — after the authoritative prune, on a full run.
-    // A bounded/subdir run never reaches this block, so its prior signature is left untouched.
-    // H2: `null` INVALIDATES (an absent/invalid-manifest configless rebuild) so a stale clean
-    // signature can't re-bless re-admitted files; a ScopeSignature stamps; undefined leaves as-is.
-    if (opts.scopeSignature === null) await store.clearScopeSignature?.();
-    else if (opts.scopeSignature) await store.setScopeSignature?.(opts.scopeSignature);
-    // generation-v1 stamp (R5#1) — computed AT INDEX BUILD, persisted beside the index, on the
-    // SAME full-run gate as the scope signature (a bounded/subdir run must not restamp a
-    // generation it did not fully build). Skipped for minimal Store fakes that expose neither
-    // setGeneration nor stats (the embedding spec comes from the store's own persisted signature,
-    // so the generation pins the embedder/chunking the index actually enforces).
+    // Identity, on the same full-run gate: a bounded or subdir run has not built the whole index
+    // and must not claim it. Absent `starId` leaves any prior stamp alone rather than clearing it —
+    // an unmanifested vault (no star.yaml id) must not silently un-stamp an index that has one.
+    if (opts.starId) await (store as { setOwnerStarId?: (id: string) => Promise<void> }).setOwnerStarId?.(opts.starId);
+    // THE ATOMIC FINALIZATION (PLAN-0.3.0 item 12; Codex R4#5). Content generation, cleared
+    // invalidation, advanced built scope and cleared dirty marker commit as ONE backend
+    // transaction. Until 0.3.0 these were four statements in four implicit transactions —
+    // setGeneration, the scope stamp/clear, and endReindex's timestamp + dirty delete — so
+    // CLEARING the stamp was atomic while SETTING it was not, and a crash between them left a
+    // generation naming rows the run had not finished building.
+    //
+    // Still on the SAME full-run gate as the built scope: a bounded/subdir run must not stamp a
+    // generation it did not fully build, and never reaches this block. The built scope keeps its
+    // tri-state — `null` INVALIDATES (an absent/invalid-manifest configless rebuild) so a stale
+    // clean signature can't re-bless re-admitted files; a ScopeSignature stamps; undefined leaves.
+    //
+    // Gated on `finalizeReindex` ALONE, never on `stats()` as well. Since endReindex was retired
+    // this block is the ONLY thing that clears `reindex_dirty`, and funes-core's `Store` permits a
+    // store that implements `beginReindex` + `finalizeReindex` and no `stats()` — which the
+    // contract note calls compliant. Under a `&& statsFn` gate such a store marked its index
+    // mid-build and never unmarked it, so every later open refused a permanently dirty index.
+    // A store with no `stats()` simply cannot report a persisted embedding signature, and
+    // "unknown embedding spec" is exactly what the `?? ""` below has always encoded for a null one.
     const statsFn = (store as { stats?: () => Promise<{ embeddingSignature: string | null }> }).stats;
-    if (store.setGeneration && statsFn) {
-      const embeddingSpec = (await statsFn.call(store)).embeddingSignature ?? "";
+    if (store.finalizeReindex) {
+      const embeddingSpec = statsFn ? ((await statsFn.call(store)).embeddingSignature ?? "") : "";
       const scope = opts.scopeSignature !== undefined ? opts.scopeSignature : ((await store.getScopeSignature?.()) ?? null);
-      await store.setGeneration(encodeGeneration({ records, scope, embeddingSpec }));
+      await store.finalizeReindex({
+        contentGeneration: encodeGeneration({ records, scope, embeddingSpec }),
+        scope: opts.scopeSignature,
+      });
     }
-    await store.endReindex?.(); // clear the dirty marker only after the prune (+ stamp/clear) commit
+    // finalizeReindex just advanced lastReindexAt, so any memoized "the vault changed since the reindex"
+    // answer is now about a stamp that no longer exists. Ordered AFTER it, never before: a memo
+    // cleared while the run could still fail would be refilled from the OLD stamp on the next query.
+    forgetVaultFreshness(vaultRoot);
   }
   return res;
 }

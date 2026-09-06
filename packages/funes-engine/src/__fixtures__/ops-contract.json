@@ -22,6 +22,26 @@
       }
     },
     {
+      "name": "recall_v2",
+      "internal": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "free-text question"
+          },
+          "k": {
+            "type": "number",
+            "description": "max results (default 5)"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
       "name": "page",
       "internal": false,
       "inputSchema": {
@@ -154,6 +174,14 @@
       }
     },
     {
+      "name": "guarded_health",
+      "internal": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
       "name": "remember",
       "internal": false,
       "inputSchema": {
@@ -212,7 +240,7 @@
           },
           "volatile": {
             "type": "boolean",
-            "description": "true if the successor is still a STATE that later writes should replace"
+            "description": "true if the successor is still a STATE that goes stale and should be replaced by a later write; false/omitted records it as an append-only EVENT. Recorded and returned by recall; supersession is still an explicit act, not automatic"
           },
           "as_of": {
             "type": "string",
@@ -265,6 +293,12 @@
       "internal": false
     },
     {
+      "name": "guarded_health",
+      "readonly": true,
+      "served": "index",
+      "internal": true
+    },
+    {
       "name": "guarded_indexed_page",
       "readonly": true,
       "served": "index",
@@ -308,6 +342,12 @@
     },
     {
       "name": "recall",
+      "readonly": true,
+      "served": "index",
+      "internal": false
+    },
+    {
+      "name": "recall_v2",
       "readonly": true,
       "served": "index",
       "internal": false

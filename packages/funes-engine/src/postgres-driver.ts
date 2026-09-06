@@ -11,6 +11,7 @@
 //      writers on other hosts. Before a genuinely multi-host constellation, beginReindex must
 //      take `pg_advisory_lock(hashtext(<star>))` through this driver (server-side mutex).
 import type { PgDriver, PgQueryResult, PgTx } from "./driver.ts";
+import { resolveEfSearch } from "funes-shared";
 
 /** Build a PgDriver over a node-postgres Pool. `pg` is imported lazily so the dependency loads
  *  only on the server tier (PGLite/libsql users never pay for it). No connection is attempted
@@ -21,7 +22,7 @@ export async function postgresDriver(connectionString: string): Promise<PgDriver
   // Every pooled connection gets the HNSW recall floor (store.init()'s SET only reaches the one
   // connection that ran it — pools need the per-connection hook). See store.ts init() for the
   // 2026-07-13 bench rationale (ef=40 default → cross-language recall collapse; ef=200 ≡ exact).
-  const efSearch = Number(process.env.FUNES_EF_SEARCH ?? 200) || 200;
+  const efSearch = resolveEfSearch(process.env); // one normalization, shared with the serving signature (item 7)
   pool.on("connect", (client) => {
     client.query(`set hnsw.ef_search = ${efSearch}`).catch(() => { /* pre-pgvector init window */ });
   });

@@ -1,6 +1,6 @@
 {
   "name": "funes-engine",
-  "version": "0.1.0-alpha.3",
+  "version": "0.3.0",
   "description": "The funes engine: the shared CLI/MCP/daemon/ops/reindex/publication/faces + the Postgres-dialect store (node-postgres, deferred profile-B). libSQL (funes-libsql) is the default+only-local backend; PGLite was removed 2026-07-20.",
   "type": "module",
   "module": "src/index.ts",
@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
     "funes-api": "workspace:*",
     "funes-core": "workspace:*",
     "funes-libsql": "workspace:*",
@@ -19,14 +20,15 @@
     "graphology-communities-louvain": "^2.0.2",
     "graphology-layout": "^0.6.1",
     "graphology-layout-forceatlas2": "^0.10.1",
-    "pg": "^8",
-    "picomatch": "4.0.3",
-    "yaml": "^2",
+    "pg": "^8.23.0",
+    "picomatch": "4.0.5",
+    "yaml": "^2.9.0",
     "zod": "4.4.3"
   },
   "license": "MIT",
   "devDependencies": {
-    "@types/pg": "^8.20.0",
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@types/pg": "^8.23.1",
     "@types/picomatch": "^4.0.3"
   }
 }

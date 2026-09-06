@@ -1,4 +1,5 @@
 import type { Embedder } from "funes-core";
+import { copyFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -41,6 +42,39 @@ export function modelCacheDir(): string {
   return process.env.FUNES_MODEL_DIR ?? join(homedir(), ".twinkling", "models");
 }
 
+/** The file a revision-pinned download never writes and the offline load cannot start without.
+ *
+ *  transformers.js 4.2.0 does not ask the model whether it has a tokenizer — it PROBES for one
+ *  before loading anything: `pipeline()` → `get_pipeline_files(task, model, {device, dtype})` →
+ *  `get_tokenizer_files(model)` → `get_file_metadata(model, "tokenizer_config.json", {})`. That
+ *  chain drops every option that matters: no `revision`, no `cache_dir`, and — the part that makes
+ *  a local-first branch a lie — no `local_files_only`. So the probe looks for the UNPINNED key
+ *  `<cache>/<model>/tokenizer_config.json`, which a pinned download never writes; it misses, and
+ *  goes to the network even under `local_files_only: true`. Offline it returns `exists: false`,
+ *  `pipeline()` concludes the model is tokenizer-less and hands back an extractor with
+ *  `tokenizer: null`, and the forward pass dies. The pinned tokenizer.json is sitting in the cache
+ *  the whole time — nothing ever asks for it.
+ *
+ *  So give the probe the file it looks for, copied from the PINNED revision. This does NOT loosen
+ *  the pin: the probe reads only `.exists` and never the contents, and if the tokenizer load itself
+ *  resolves this path first it gets the pinned revision's own bytes. tokenizer.json — the vocab,
+ *  the file that decides the input ids and therefore the embedding — is never copied and stays
+ *  pinned-only, so two loci still embed byte-identically.
+ *
+ *  CEILING: this is shaped to one library's internal cache layout, measured at @huggingface/
+ *  transformers 4.2.0. The upstream fix is for `get_pipeline_files` to forward the pretrained
+ *  options it is already given; when it does, this becomes a no-op and can be deleted. */
+export function seedTokenizerProbe(cache: string, model: string, revision: string): void {
+  if (revision === "main") return; // unpinned: the probe's key IS the key the download writes
+  try {
+    const unpinned = join(cache, model, "tokenizer_config.json");
+    const pinned = join(cache, model, revision, "tokenizer_config.json");
+    // Never clobber: a cache shared with an UNPINNED load of the same model already holds main's
+    // own copy at that key, and that file is the unpinned load's, not ours to replace.
+    if (!existsSync(unpinned) && existsSync(pinned)) copyFileSync(pinned, unpinned);
+  } catch { /* read-only cache dir: the network path still works — seeding must never be the failure */ }
+}
+
 export class E5Embedder implements Embedder {
   readonly dim = E5_DIM;
   /** Embedding-signature identity (H1 drift guard) — MUST reflect the actual model in use
@@ -80,22 +114,24 @@ export class E5Embedder implements Embedder {
         return p;
       };
 
+      // Before the local attempt, because on a warm cache the pinned copy is already there and the
+      // probe that decides whether this model has a tokenizer at all runs FIRST, unpinned and
+      // network-bound (see seedTokenizerProbe). Without this the local-first branch below cannot
+      // succeed for a pinned model no matter how complete the cache is.
+      seedTokenizerProbe(cache, this.model, this.revision);
       try {
         // Local first, so a warm cache does not depend on the network being reachable.
-        // CEILING (measured, transformers.js 4.2.0): this only succeeds for an UNPINNED model. The
-        // tokenizer's cache key drops `revision`, so a revision-pinned load offline finds the model
-        // and not the tokenizer. We keep the pin — it is what makes two loci embed byte-identically
-        // — and accept that a cold network is a hard failure, with an error that says so.
         this.extractor = await load(true);
       } catch {
         try {
           this.extractor = await load(false);
+          seedTokenizerProbe(cache, this.model, this.revision); // the download just wrote the pinned copy
         } catch (e) {
           throw new Error(
             `funes: could not load the embedding model ${this.model}@${this.revision.slice(0, 8)}.\n` +
             `  cache: ${cache}   (override with FUNES_MODEL_DIR)\n` +
             `  Not usable from that cache, and the download failed — check access to huggingface.co.\n` +
-            `  A first run fetches ~145MB and takes ~70s; the cache is reused across upgrades.\n` +
+            `  A first run fetches 135MB and takes ~70s; the cache is reused across upgrades.\n` +
             `  cause: ${(e as Error).message}`,
           );
         }

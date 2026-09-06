@@ -35,9 +35,13 @@ test("P2.10 title weighting: a TITLE match outranks a body-only mention of the s
   await s.close();
 });
 
-test("P2.10 schema migration: a pre-2 single-column fts index auto-migrates on a WRITER open (no re-embed)", async () => {
+// Until the 0.3.0 schema fence (PLAN-0.3.0 R2#2) this asserted that a pre-2 index AUTO-MIGRATED on
+// a writer open (fts rebuilt from nodes, no re-embed, stamped current). The ladder is retired: the
+// same downgraded fixture is now REFUSED with the rebuild named, and the single-column fts table is
+// still there afterwards — the refusal mutates nothing.
+test("P2.10 schema fence: a pre-2 single-column fts index is REFUSED on a WRITER open, untouched", async () => {
   const dbPath = join(mkdtempSync(join(tmpdir(), "funes-p210-")), "idx.db");
-  // build a normal v2 index, then DOWNGRADE it to the pre-2 shape (single-column fts, no schema_version)
+  // build a normal index, then DOWNGRADE it to the pre-2 shape (single-column fts, no schema_version)
   const s1 = await LibsqlStore.create(new Fake(), dbPath);
   await s1.remember([
     { id: "notes/creatine", title: "Creatine", body: "supplementation notes" },
@@ -53,15 +57,12 @@ test("P2.10 schema migration: a pre-2 single-column fts index auto-migrates on a
   `);
   raw.close();
 
-  // re-open (writer): auto-migrate the fts table from nodes, stamp schema_version, recall works + weighted
-  const s2 = await LibsqlStore.create(new Fake(), dbPath);
-  const sv = (new Database(dbPath).prepare("select value from meta where key='schema_version'").get() as { value: string }).value;
-  expect(sv).toBe("3"); // pre-2 migrates all the way to current (fts split + provenance columns)
-  const cols = (new Database(dbPath).prepare("select * from nodes_fts limit 1").get()) as Record<string, unknown>;
-  expect("title" in cols && "description" in cols && "body" in cols).toBe(true); // migrated to 4-column
-  const res = await s2.recall({ query: "creatine", k: 2 });
-  expect(res[0]!.id).toBe("notes/creatine"); // title weighting active post-migration
-  await s2.close();
+  await expect(LibsqlStore.create(new Fake(), dbPath)).rejects.toThrow(/schema_version "pre-2" != "4".*reindex --fresh/s);
+  const after = new Database(dbPath);
+  expect(after.prepare("select value from meta where key='schema_version'").get()).toBeUndefined(); // no stamp on the way out
+  const cols = after.prepare("select * from nodes_fts limit 1").get() as Record<string, unknown>;
+  expect("content" in cols && !("title" in cols)).toBe(true); // still the pre-2 single column — nothing rebuilt
+  after.close();
 });
 
 test("P2.10 schema migration: a READ-ONLY open REFUSES a pre-2 index (can't migrate)", async () => {

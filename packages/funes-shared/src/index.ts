@@ -8,7 +8,13 @@
 // (scripts/lint-core-imports.ts). These three need node:crypto / node:fs, so they live one tier up.
 export { GENERATION_VERSION, PARSER_VERSION, INDEX_SCHEMA_VERSION, hashItem, normalizeGenerationPath, generationRecord, encodeGeneration } from "./generation.ts";
 export type { GenerationRecord, GenerationInputs } from "./generation.ts";
-export { zoneOfDir, zoneOfFile, memoryZoneOf } from "./zones.ts";
+export {
+  SERVING_SEMANTICS_VERSION, RANKING_SEMANTICS_VERSION, TRUST_ADJUST_VERSION, ZONE_ADJUST_VERSION,
+  DISTILL_ADJUST_VERSION, ENTITY_ADJUST_VERSION, DEFAULT_EF_SEARCH,
+  resolveRrfK, resolveEfSearch, servingSignature,
+} from "./serving-signature.ts";
+export type { ServingEnv, ServingSignatureInputs } from "./serving-signature.ts";
+export { zoneOfDir, zoneOfFile, trustDefaultOfFile, memoryZoneOf } from "./zones.ts";
 export type { Zone } from "./zones.ts";
 export { acquireWriteLock, withWriteLock, withScopedWriteLock, lockPathFor } from "./write-lock.ts";
 export type { WriteLock, WriteLockOpts } from "./write-lock.ts";

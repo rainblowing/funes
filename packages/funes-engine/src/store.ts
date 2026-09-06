@@ -1,5 +1,6 @@
-import type { PgDriver } from "./driver.ts";
+import type { PgDriver, PgTx } from "./driver.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import Graph from "graphology";
 import { circular } from "graphology-layout";
@@ -8,15 +9,16 @@ import louvain from "graphology-communities-louvain";
 // P3.14: the index-store CONTRACT (these interfaces) moved to funes-core — types only, so the
 // portable tier can hold them and funes-libsql stops importing this package. Implementations
 // (PostgresStore below, the graph bake) stay here. Re-exported so existing importers are unchanged.
-export type { FreshnessFields, HotlistRow, GraphNode, GraphEdge, GraphArtifact, IndexedPage, NeighborsResult, GuardedResult, FunesIndexStore } from "funes-core";
-import type { FreshnessFields, HotlistRow, GraphNode, GraphEdge, GraphArtifact, IndexedPage, NeighborsResult, GuardedResult, FunesIndexStore } from "funes-core";
-import type { Embedder, MemoryItem, RecallQuery, RecallResult, RememberResult, ScopeSignature, Store, Trust } from "funes-core";
+export type { FreshnessFields, HotlistRow, GraphNode, GraphEdge, GraphArtifact, GraphAuditRows, IndexedPage, NeighborsResult, GuardedResult, FunesIndexStore, ContentIdentity, IndexStats } from "funes-core";
+import type { FreshnessFields, HotlistRow, GraphNode, GraphEdge, GraphArtifact, GraphAuditRows, IndexedPage, NeighborsResult, GuardedResult, FunesIndexStore, ContentIdentity, IndexStats } from "funes-core";
+import type { Embedder, FinalizeReindex, MemoryItem, RecallQuery, RecallResult, RememberResult, ScopeSignature, Store, Trust } from "funes-core";
 import { rrf, rrfScores, resolveGraphArm, embeddingSignature, normalizeRelationType, buildGraphArm, GRAPH_ARM_CAP_OUT, GRAPH_ARM_CAP_IN, GRAPH_ARM_HUB_MAX } from "funes-core";
 import type { GraphNeighborRow } from "funes-core";
 import { acquireWriteLock, withWriteLock } from "funes-shared";
 import type { WriteLock } from "funes-shared";
-import { guardRefusal } from "./scope.ts";
-import { hashItem } from "funes-shared";
+import { expectationRefusal } from "./scope.ts";
+import type { ScopeExpectation } from "funes-core";
+import { hashItem, resolveEfSearch, servingSignature, GENERATION_VERSION } from "funes-shared";
 import { CHUNK_SIG, chunkText } from "./embedder.ts";
 import type { Reranker } from "./rerank.ts";
 import { zoneOfFile, type Zone } from "funes-shared";
@@ -155,6 +157,13 @@ export const ZONE_WEIGHT: Record<Zone, number> = {
  *  below hand-authored wiki (1.0). Generic OUTPUT 0.7 was demoting the very layer Ruling B promoted.
  *  Segment match at any depth (vault-v2 zone semantics). MIRRORED in funes-libsql/src/ranking.ts. */
 export const DISTILL_WEIGHT = 0.87;
+
+/** ts_rank's DEFAULT weights for the two tsvector classes this backend assigns: title is
+ *  setweight'd 'A' and description+body 'D' (see the search_vector expressions below). They are the
+ *  postgres analogue of libsql's bm25 column weights and they enter the serving signature as such —
+ *  change either setweight class and these must move with it. */
+export const PG_TS_WEIGHT_A = 1.0;
+export const PG_TS_WEIGHT_D = 0.1;
 const isDistill = (path: string): boolean => path.split("/").some((s) => s === "out_distill");
 
 export function zoneAdjust(score: number, path: string): number {
@@ -241,7 +250,9 @@ const RELATION_FAMILIES: Record<string, string[]> = {
 // fallback. Mapped to "structural" DELIBERATELY (status quo made explicit, zero render change);
 // re-familying `mentions` is an E-lane call, not a behavior-neutral one. Lookups normalize
 // spelling (underscore/hyphen) through normalizeRelationType — storage keeps authored strings.
-const TYPE_TO_FAMILY: Record<string, string> = { "related-to": "structural", mentions: "structural" };
+// `references` joins them (2026-08-22, serena `mem:` extraction): a cross-reference between two
+// memories is associative like `related-to`, not evidential like `cites`.
+const TYPE_TO_FAMILY: Record<string, string> = { "related-to": "structural", mentions: "structural", references: "structural" };
 for (const fam in RELATION_FAMILIES) for (const t of RELATION_FAMILIES[fam]!) TYPE_TO_FAMILY[t] = fam;
 const familyOf = (type: string): string => TYPE_TO_FAMILY[normalizeRelationType(type)] ?? "structural";
 
@@ -332,7 +343,9 @@ export class PostgresStore implements FunesIndexStore {
     // — the offline-eval harness scores hit@5 (expected-id in top 5), not judged precision).
     // The node-postgres pool applies this per-connection in postgres-driver.ts. FUNES_EF_SEARCH
     // overrides (re-measure the latency trade at 100k+ vectors before raising further).
-    await d.exec(`set hnsw.ef_search = ${Number(process.env.FUNES_EF_SEARCH ?? 200) || 200};`).catch?.(() => {});
+    // Resolved through funes-shared (item 7): the serving signature signs the ef_search this
+    // process actually searches at, so the normalization must exist in exactly one place.
+    await d.exec(`set hnsw.ef_search = ${resolveEfSearch(process.env)};`).catch?.(() => {});
     await d.exec(`
       create table if not exists meta(key text primary key, value text);
       create table if not exists nodes(
@@ -387,6 +400,14 @@ export class PostgresStore implements FunesIndexStore {
         [this.sig],
       );
     }
+    // PLAN-0.3.0 item 15/17: the random per-database instance id, mirroring funes-libsql. Machine
+    // state binds to `publicationId ?? instanceId` — never a path hash, which is unchanged when a
+    // DIFFERENT database replaces the file at that path. Stamped for existing databases too, or a
+    // pre-0.3.0 index would have nothing to bind to for the rest of its life.
+    await d.query(
+      "insert into meta(key,value) values ('instance_id',$1) on conflict (key) do nothing",
+      [randomUUID()],
+    );
     // H2 dirty-marker epoch: an interrupted FULL reindex leaves this set; refuse normal opens
     // so a partial live index is never silently served. `funes reindex` opens with allowDirty.
     const dirty = await d.query<{ value: string }>("select value from meta where key = 'reindex_dirty'");
@@ -415,18 +436,29 @@ export class PostgresStore implements FunesIndexStore {
     await d.exec("create unique index if not exists edges_uniq on edges(source, type, target);");
   }
 
-  /** H2: mark a full rebuild in progress (cleared by endReindex after the prune commits). */
+  /** H2: mark a full rebuild in progress (cleared by finalizeReindex after the prune commits). */
   async beginReindex(): Promise<void> {
     const res = this.lockResource;
-    if (res) this.reindexLock = await acquireWriteLock(res); // held until endReindex (or close-belt)
+    if (res) this.reindexLock = await acquireWriteLock(res); // held until finalizeReindex (or close-belt)
     await this.db.query("insert into meta(key,value) values ('reindex_dirty','1') on conflict (key) do update set value='1'");
   }
 
-  async endReindex(): Promise<void> {
-    // Freshness honesty (stack review B-4): stamp the completed full rebuild (see libsql mirror).
-    await this.db.query("insert into meta(key,value) values ('last_reindex_at',$1) on conflict (key) do update set value=$1", [new Date().toISOString()]);
-    await this.db.query("delete from meta where key = 'reindex_dirty'");
-    this.reindexLock?.release();
+  /** PLAN-0.3.0 item 12, mirroring the libsql implementation: the content generation, the cleared
+   *  invalidation, the built scope, the freshness stamp and the dirty marker commit as ONE
+   *  transaction. (Postgres is PARKED for 0.3.0 — item 4 — but the contract is one contract, and a
+   *  backend that finalized non-atomically would be a second locus of the bug.) */
+  async finalizeReindex(f: FinalizeReindex): Promise<void> {
+    await this.db.transaction(async (tx) => {
+      await this.metaSet(tx, "generation", f.contentGeneration);
+      await this.metaDel(tx, "generation_invalidated_at");
+      await this.metaDel(tx, "generation_invalidated_reason");
+      if (f.scope === null) { await this.metaDel(tx, "index_scope_hash"); await this.metaDel(tx, "index_scope_ignored"); }
+      else if (f.scope) { await this.metaSet(tx, "index_scope_hash", f.scope.hash); await this.metaSet(tx, "index_scope_ignored", f.scope.ignoreScope ? "1" : "0"); }
+      // Freshness honesty (stack review B-4): stamp the completed full rebuild (see libsql mirror).
+      await this.metaSet(tx, "last_reindex_at", new Date().toISOString());
+      await this.metaDel(tx, "reindex_dirty");
+    });
+    this.reindexLock?.release(); // after the commit, never inside it
     this.reindexLock = undefined;
   }
 
@@ -448,30 +480,51 @@ export class PostgresStore implements FunesIndexStore {
     // so a frontmatter flip on any of them must update skipped rows too — one batched
     // statement, no re-embed.
     if (unchanged.length) {
-      await d.query(
-        `update nodes set trust = u.trust, volatile = u.volatile, freshness = u.freshness::timestamptz,
-                description = u.description, resource = u.resource,
-                source = u.source, authored = u.authored::timestamptz,
-                -- see funes-libsql store.ts: 'unknown' (the reindex default) never overwrites a real actor
-                write_actor = coalesce(nullif(u.write_actor::text,'unknown'), nodes.write_actor),
-                search_vector = setweight(to_tsvector('simple', coalesce(nodes.title,'')), 'A')
-                             || setweight(to_tsvector('simple', left(coalesce(u.description,'') || ' ' || nodes.body, ${FTS_MAX_CHARS})), 'D')
-           from (select unnest($1::text[]) as id, unnest($2::text[]) as trust,
-                        unnest($3::boolean[]) as volatile, unnest($4::text[]) as freshness,
-                        unnest($5::text[]) as description, unnest($6::text[]) as resource,
-                        unnest($7::text[]) as source, unnest($8::text[]) as authored, unnest($9::text[]) as write_actor) u
-          where nodes.id = u.id and (nodes.trust is distinct from u.trust
-             or nodes.volatile is distinct from u.volatile
-             or nodes.freshness is distinct from u.freshness::timestamptz
-             or nodes.description is distinct from u.description
-             or nodes.resource is distinct from u.resource
-             or nodes.source is distinct from u.source
-             or nodes.authored is distinct from u.authored::timestamptz
-             or nodes.write_actor is distinct from coalesce(nullif(u.write_actor::text,'unknown'), nodes.write_actor))`,
-        [unchanged.map((it) => it.id), unchanged.map((it) => it.trust ?? "untrusted"),
-          unchanged.map(isVolatile), unchanged.map(freshnessIso),
-          unchanged.map((it) => it.description ?? null), unchanged.map((it) => it.resource ?? null),
-          unchanged.map((it) => it.source ?? null), unchanged.map(authoredIso), unchanged.map(() => this.writeActor)]);
+      // ONE transaction, TWO statements (PLAN-0.3.0 item 11, closing both Postgres gaps it names).
+      // The sync used to run OUTSIDE a transaction, and its single WHERE clause covered write_actor
+      // as well — so its affected-row count could not serve as evidence: a reindex that merely
+      // re-stamped the actor would have invalidated the content generation and cost the star a
+      // manual republish for a change no reader can observe. The generation-participating columns
+      // now move (and invalidate) together; the advisory actor stamp moves on its own.
+      await this.db.transaction(async (tx) => {
+        const moved = await tx.query(
+          // `type` joined this list with the content generation's v2 widening (PLAN-0.3.0 item 6): a
+          // type-only frontmatter edit is hash-skipped, so before this it moved the generation while
+          // never reaching the row, and the recomputed target could not match the built index.
+          `update nodes set type = u.type, trust = u.trust, volatile = u.volatile, freshness = u.freshness::timestamptz,
+                  description = u.description, resource = u.resource,
+                  source = u.source, authored = u.authored::timestamptz,
+                  search_vector = setweight(to_tsvector('simple', coalesce(nodes.title,'')), 'A')
+                               || setweight(to_tsvector('simple', left(coalesce(u.description,'') || ' ' || nodes.body, ${FTS_MAX_CHARS})), 'D')
+             from (select unnest($1::text[]) as id, unnest($2::text[]) as trust,
+                          unnest($3::boolean[]) as volatile, unnest($4::text[]) as freshness,
+                          unnest($5::text[]) as description, unnest($6::text[]) as resource,
+                          unnest($7::text[]) as source, unnest($8::text[]) as authored,
+                          unnest($9::text[]) as type) u
+            where nodes.id = u.id and (nodes.type is distinct from u.type
+               or nodes.trust is distinct from u.trust
+               or nodes.volatile is distinct from u.volatile
+               or nodes.freshness is distinct from u.freshness::timestamptz
+               or nodes.description is distinct from u.description
+               or nodes.resource is distinct from u.resource
+               or nodes.source is distinct from u.source
+               or nodes.authored is distinct from u.authored::timestamptz)`,
+          [unchanged.map((it) => it.id), unchanged.map((it) => it.trust ?? "untrusted"),
+            unchanged.map(isVolatile), unchanged.map(freshnessIso),
+            unchanged.map((it) => it.description ?? null), unchanged.map((it) => it.resource ?? null),
+            unchanged.map((it) => it.source ?? null), unchanged.map(authoredIso),
+            unchanged.map((it) => it.type ?? null)]);
+        // The ADVISORY half, on its own and deliberately evidence-free: 'unknown' (the reindex
+        // default) never overwrites a real actor, and a real actor moving changes no served row.
+        await tx.query(
+          `update nodes set write_actor = coalesce(nullif(u.write_actor::text,'unknown'), nodes.write_actor)
+             from (select unnest($1::text[]) as id, unnest($2::text[]) as write_actor) u
+            where nodes.id = u.id
+              and nodes.write_actor is distinct from coalesce(nullif(u.write_actor::text,'unknown'), nodes.write_actor)`,
+          [unchanged.map((it) => it.id), unchanged.map(() => this.writeActor)]);
+        const n = moved.affectedRows ?? 0;
+        if (n > 0) await this.invalidateContentGeneration(tx, `remember: metadata sync moved ${n} row${n === 1 ? "" : "s"}`);
+      });
     }
     if (changed.length === 0) return { indexed: 0, skipped: items.length };
 
@@ -519,6 +572,9 @@ export class PostgresStore implements FunesIndexStore {
           await tx.query("insert into edges(source,type,target,weight) values ($1,$2,$3,$4) on conflict do nothing",
             [it.id, e.type, e.target, e.weight ?? 1.0]);
       }
+      // Item 11: `changed` IS the evidence, by construction — every row here carries a new content
+      // hash, so the index no longer holds the rows the stamped content generation named.
+      await this.invalidateContentGeneration(tx, `remember: ${changed.length} page${changed.length === 1 ? "" : "s"} re-indexed`);
     });
     return { indexed: changed.length, skipped: items.length - changed.length };
   }
@@ -527,11 +583,19 @@ export class PostgresStore implements FunesIndexStore {
   async remove(ids: string[]): Promise<number> {
     if (ids.length === 0) return 0;
     return this.locked(async () => {
-      const d = this.db;
-      const r = await d.query("delete from nodes where id = any($1::text[])", [ids]);
-      await d.query("delete from chunks where page_id = any($1::text[])", [ids]);
-      await d.query("delete from edges where source = any($1::text[])", [ids]);
-      return r.affectedRows ?? 0;
+      // ONE transaction (item 11's second Postgres gap): three independent deletes could commit
+      // one, crash, and leave chunks or edges behind for rows that no longer exist.
+      let removed = 0;
+      await this.db.transaction(async (tx) => {
+        const r = await tx.query("delete from nodes where id = any($1::text[])", [ids]);
+        const c = await tx.query("delete from chunks where page_id = any($1::text[])", [ids]);
+        const e = await tx.query("delete from edges where source = any($1::text[])", [ids]);
+        removed = r.affectedRows ?? 0;
+        // A remove that matched NOTHING changed no served row and must not invalidate.
+        const touched = removed + (c.affectedRows ?? 0) + (e.affectedRows ?? 0);
+        if (touched > 0) await this.invalidateContentGeneration(tx, `remove: ${removed} page row${removed === 1 ? "" : "s"} deleted`);
+      });
+      return removed;
     });
   }
 
@@ -542,9 +606,13 @@ export class PostgresStore implements FunesIndexStore {
       let removed = 0;
       await this.db.transaction(async (tx) => {
         const r = await tx.query("delete from nodes where not (id = any($1::text[]))", [keepIds]);
-        await tx.query("delete from chunks where not (page_id = any($1::text[]))", [keepIds]);
-        await tx.query("delete from edges where not (source = any($1::text[]))", [keepIds]);
+        const c = await tx.query("delete from chunks where not (page_id = any($1::text[]))", [keepIds]);
+        const e = await tx.query("delete from edges where not (source = any($1::text[]))", [keepIds]);
         removed = r.affectedRows ?? 0;
+        // A prune that deleted nothing — every clean-tree full reindex ends in one — changed no
+        // served row, so it must not invalidate the content generation (item 11).
+        const touched = removed + (c.affectedRows ?? 0) + (e.affectedRows ?? 0);
+        if (touched > 0) await this.invalidateContentGeneration(tx, `prune: ${removed} stale page row${removed === 1 ? "" : "s"} deleted`);
       });
       return removed;
     });
@@ -949,7 +1017,7 @@ export class PostgresStore implements FunesIndexStore {
 
   /** Read-only health snapshot for the S2 daemon/console (no mutation). Carries the index_scope
    *  signature so the cross-star (--ops) serve-time guard can read it over the daemon-proxy path. */
-  async stats(): Promise<{ nodes: number; edges: number; embeddingSignature: string | null; reindexDirty: boolean; lastReindexAt: string | null; scopeHash: string | null; ignoreScope: boolean; generation: string | null }> {
+  async stats(): Promise<IndexStats> {
     const d = this.db;
     const n = await d.query<{ c: string }>("select count(*)::text as c from nodes");
     const e = await d.query<{ c: string }>("select count(*)::text as c from edges");
@@ -965,19 +1033,90 @@ export class PostgresStore implements FunesIndexStore {
       lastReindexAt: last.rows[0]?.value ?? null,
       scopeHash: scope?.hash ?? null,
       ignoreScope: scope?.ignoreScope ?? false,
-      generation: await this.getGeneration(),
+      // Item 20: postgres persists no `schema_version` row (the fts5 migration ladder that row
+      // versions is a libsql concern), so it honestly reports unknown rather than echoing the
+      // serving process's own constant back as if the database had asserted it.
+      schemaVersion: await this.metaGet(this.db, "schema_version"),
+      ...(await this.contentIdentity()), // item 13: health reports WHY there is no content generation
     };
   }
 
-  /** generation-v1 (R5#1): persist the content-generation stamp of the last FULL build — meta key
-   *  `generation`, advanced by reindex.ts exactly where the scope signature is (full runs only). */
-  async setGeneration(generation: string): Promise<void> {
-    await this.db.query("insert into meta(key,value) values ('generation',$1) on conflict (key) do update set value=$1", [generation]);
+  /** Item 18: id-only enumeration — the deletion half of the freshness signal (see FunesIndexStore). */
+  async indexedIds(): Promise<string[]> {
+    return (await this.db.query<{ id: string }>("select id from nodes")).rows.map((r) => r.id);
   }
 
-  async getGeneration(): Promise<string | null> {
-    const r = await this.db.query<{ value: string }>("select value from meta where key = 'generation'");
-    return r.rows[0]?.value ?? null;
+  /** Item 15/17: the random per-database instance id, stamped by init(). */
+  async instanceId(): Promise<string | null> {
+    return this.metaGet(this.db, "instance_id");
+  }
+
+  /** Item 7/20: THIS process's serving signature. Postgres's text arm is ts_rank over a tsvector
+   *  whose title is setweight'd 'A' and whose description+body are 'D', so the "column weights"
+   *  that actually order this backend are ts_rank's weights for the two CLASSES it assigns — the
+   *  values are what must move the signature, and these are them. */
+  servingSignature(): string {
+    return servingSignature({
+      backend: "postgres",
+      bm25ColumnWeights: [PG_TS_WEIGHT_A, PG_TS_WEIGHT_D],
+      reranker: this.reranker ? (this.reranker.id ?? "unnamed-reranker") : null,
+    });
+  }
+
+  /** Step 24: the raw audit rows. No join to nodes and no type normalization — both would erase
+   *  exactly what the audit exists to count. See funes-core's GraphAuditRows for why the analysis
+   *  is not here. */
+  async auditGraph(): Promise<GraphAuditRows> {
+    const d = this.db;
+    const nodeIds = (await d.query<{ id: string }>("select id from nodes")).rows.map((r) => r.id);
+    const edges = (await d.query<{ source: string; type: string; target: string }>(
+      "select source, type, target from edges")).rows;
+    return { nodeIds, edges };
+  }
+
+  // ── content identity (PLAN-0.3.0 item 8), mirroring funes-libsql ────────────────────────────
+  private async metaGet(q: PgTx, key: string): Promise<string | null> {
+    return (await q.query<{ value: string }>("select value from meta where key = $1", [key])).rows[0]?.value ?? null;
+  }
+  private async metaSet(q: PgTx, key: string, value: string): Promise<void> {
+    await q.query("insert into meta(key,value) values ($1,$2) on conflict (key) do update set value=$2", [key, value]);
+  }
+  private async metaDel(q: PgTx, key: string): Promise<void> {
+    await q.query("delete from meta where key = $1", [key]);
+  }
+
+  /** What this database says it IS. See ContentIdentity (funes-core); a legacy v1 stamp is reported
+   *  INVALID (null) rather than reinterpreted — incremental writes never cleared it. */
+  async contentIdentity(): Promise<ContentIdentity> {
+    const stamped = await this.metaGet(this.db, "generation");
+    const valid = stamped != null && stamped.startsWith(`${GENERATION_VERSION}:`);
+    return {
+      publicationId: await this.metaGet(this.db, "publication_id"),
+      contentGeneration: valid ? stamped : null,
+      invalidatedAt: await this.metaGet(this.db, "generation_invalidated_at"),
+      invalidatedReason: (await this.metaGet(this.db, "generation_invalidated_reason"))
+        ?? (stamped != null && !valid ? `legacy ${stamped.split(":")[0]} stamp — not a content generation; reindex to establish one` : null),
+    };
+  }
+
+  /** IMMUTABLE (item 8) — local state binds to this id, so a silent rename strands every ack. */
+  async setPublicationId(publicationId: string): Promise<void> {
+    const existing = await this.metaGet(this.db, "publication_id");
+    if (existing != null && existing !== publicationId) {
+      throw new Error(`funes: publication id is immutable — this index already carries "${existing}", refusing to restamp it as "${publicationId}"`);
+    }
+    await this.metaSet(this.db, "publication_id", publicationId);
+  }
+
+  /** EVIDENCE-DRIVEN invalidation (item 11) — inside the caller's transaction, with proof that a
+   *  generation-participating row moved. See the libsql mirror for why blanket invalidation is a
+   *  cost bomb. Recorded only when there IS a stamp to kill (item 13: `invalidatedAt` means "when
+   *  the last valid stamp died"). */
+  private async invalidateContentGeneration(tx: PgTx, reason: string): Promise<void> {
+    if (await this.metaGet(tx, "generation") == null) return;
+    await this.metaDel(tx, "generation");
+    await this.metaSet(tx, "generation_invalidated_at", new Date().toISOString());
+    await this.metaSet(tx, "generation_invalidated_reason", reason);
   }
 
   /** Persist the index_scope signature (closure sprint 3B) — meta keys `index_scope_hash` +
@@ -1019,11 +1158,13 @@ export class PostgresStore implements FunesIndexStore {
    *  re-admits excluded rows always flips reindexDirty at begin and the signature (hash/ignore/clear)
    *  at end — both windows refuse — while a same-manifest reindex re-excludes the identical rows and
    *  so never serves an excluded one. Never mtime-cached (timestamps are preservable). */
-  async guardedRead<T>(expectedHash: string, retrieve: () => Promise<T>): Promise<GuardedResult<T>> {
-    const r1 = guardRefusal(await this.scopeState(), expectedHash);
+  async guardedRead<T>(expected: () => ScopeExpectation, retrieve: () => Promise<T>): Promise<GuardedResult<T>> {
+    // Item 16: `expected()` is re-evaluated on the second check, not captured — a `star.yaml` that
+    // narrows DURING the retrieval refuses on the way out (mirrors funes-libsql).
+    const r1 = expectationRefusal(await this.scopeState(), expected());
     if (r1) return { refusal: r1 };
     const value = await retrieve();
-    const r2 = guardRefusal(await this.scopeState(), expectedHash);
+    const r2 = expectationRefusal(await this.scopeState(), expected());
     if (r2) return { refusal: r2 };
     return { ok: value };
   }

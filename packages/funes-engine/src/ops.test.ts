@@ -1,10 +1,12 @@
 import { test, expect } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Embedder } from "funes-core";
 import { LibsqlStore } from "../../funes-libsql/src/index.ts";
 import { FunesStore } from "./funes-store.ts";
+import { indexDir } from "./reindex.ts";
+import { scopeHash } from "./scope.ts";
 import { createRegistry, operations, buildToolDefs, dispatchToolCall, opCapabilities, type Operation, type OperationContext } from "./ops.ts";
 
 class FakeEmbedder implements Embedder {
@@ -71,6 +73,207 @@ test("recall (S3): unrestricted surface — in_* included but trust-labeled; pro
   } finally { await cleanup(); }
 });
 
+// health has carried this flag since alpha.3, but health is a call an agent never makes on its way
+// to an answer — so nothing told a model its citation came from an index older than the notes.
+// Two vaults, not one: the verdict is memoized per vault for 30s (recall would otherwise pay a full
+// mtime walk per query), so a single vault cannot show both states inside one test.
+async function stalenessVault(nudge: (dir: string) => void) {
+  const vault = mkdtempSync(join(tmpdir(), "funes-ops-stale-"));
+  writeFileSync(join(vault, "fitness.md"), "---\ntitle: Fitness\n---\nprotein creatine goals\n");
+  utimesSync(join(vault, "fitness.md"), 1000, 1000); // safely before the reindex stamp
+  const store = await LibsqlStore.create(new FakeEmbedder(), join(vault, "i.db"));
+  await indexDir(store, vault, vault, {}); // stamps last_reindex_at
+  nudge(vault);
+  const ctx: OperationContext = { remote: true, trust: "untrusted", vault, store, funes: new FunesStore(store, { root: vault }) };
+  return { ctx, cleanup: async () => { await store.close(); rmSync(vault, { recursive: true, force: true }); } };
+}
+
+test("recall flags a hit when the vault has moved past the index, and stays silent when it has not", async () => {
+  const current = await stalenessVault(() => {});
+  try {
+    const res = (await dispatchToolCall(operations, "recall", { query: "protein creatine goals" }, current.ctx)) as Array<Record<string, unknown>>;
+    expect(res.length).toBeGreaterThan(0);
+    expect(res.some((r) => "vaultChangedSinceReindex" in r)).toBe(false); // additive: absent on a current index
+  } finally { await current.cleanup(); }
+
+  const moved = await stalenessVault((dir) => {
+    writeFileSync(join(dir, "fitness.md"), "---\ntitle: Fitness\n---\nprotein creatine goals rewritten\n");
+    utimesSync(join(dir, "fitness.md"), Date.now() / 1000 + 3600, Date.now() / 1000 + 3600);
+  });
+  try {
+    const res = (await dispatchToolCall(operations, "recall", { query: "protein creatine goals" }, moved.ctx)) as Array<Record<string, unknown>>;
+    expect(res.length).toBeGreaterThan(0);
+    expect(res.every((r) => r.vaultChangedSinceReindex === true)).toBe(true);
+  } finally { await moved.cleanup(); }
+}, 30_000);
+
+// ...and the guarded twin is the population it matters MOST for: a cross-star caller is reading
+// someone else's star, so it cannot run `health` there — this key is its only way to learn the rows
+// it is about to cite predate the notes. It shipped without one (shapeRecall's second argument was
+// simply never passed) while the comment above shapeRecall asserted both paths returned the same
+// shape. Needs a real manifest + matching signature: crossStarExpectedHash refuses without one.
+test("guarded_recall carries the staleness flag too, so a cross-star caller is not the last to know", async () => {
+  const vault = mkdtempSync(join(tmpdir(), "funes-ops-xstale-"));
+  writeFileSync(join(vault, "star.yaml"), 'version: 2\nmemory:\n  index_scope:\n    exclude:\n      - "raw/**"\n');
+  writeFileSync(join(vault, "fitness.md"), "---\ntitle: Fitness\n---\nprotein creatine goals\n");
+  utimesSync(join(vault, "fitness.md"), 1000, 1000); // safely before the reindex stamp
+  const store = await LibsqlStore.create(new FakeEmbedder(), join(vault, "i.db"));
+  await indexDir(store, vault, vault, { scopeSignature: { hash: scopeHash(["raw/**"]), ignoreScope: false } });
+  const future = Date.now() / 1000 + 3600;
+  writeFileSync(join(vault, "fitness.md"), "---\ntitle: Fitness\n---\nprotein creatine goals rewritten\n");
+  utimesSync(join(vault, "fitness.md"), future, future); // the vault has moved past the index
+  const ctx: OperationContext = { remote: true, trust: "untrusted", vault, store, funes: new FunesStore(store, { root: vault }) };
+  try {
+    const res = (await dispatchToolCall(operations, "guarded_recall", { query: "protein creatine goals" }, ctx)) as Array<Record<string, unknown>>;
+    expect(res.length).toBeGreaterThan(0);
+    expect(res.every((r) => r.vaultChangedSinceReindex === true)).toBe(true);
+  } finally { await store.close(); rmSync(vault, { recursive: true, force: true }); }
+}, 30_000);
+
+// ── PLAN-0.3.0 item 16 — the own-star scope guard, at the dispatcher every surface routes through ─
+async function driftVault(): Promise<{ ctx: OperationContext; cleanup: () => Promise<void> }> {
+  const vault = mkdtempSync(join(tmpdir(), "funes-ops-drift-"));
+  writeFileSync(join(vault, "star.yaml"), 'memory:\n  index_scope:\n    exclude:\n      - "raw/**"\n');
+  writeFileSync(join(vault, "keep.md"), "---\ntitle: Keep\n---\nprotein creatine goals\n");
+  const store = await LibsqlStore.create(new FakeEmbedder(), join(vault, "i.db"));
+  await indexDir(store, vault, vault, { scopeSignature: { hash: scopeHash(["raw/**"]), ignoreScope: false } });
+  // The operator narrows policy and has NOT reindexed. Before item 16 this state was enforced only
+  // on the --cross-star path, so every local client went on being served the withdrawn rows.
+  writeFileSync(join(vault, "star.yaml"), 'memory:\n  index_scope:\n    exclude:\n      - "raw/**"\n      - "secrets/**"\n');
+  const ctx: OperationContext = { remote: true, trust: "untrusted", vault, store, funes: new FunesStore(store, { root: vault }) };
+  return { ctx, cleanup: async () => { await store.close(); rmSync(vault, { recursive: true, force: true }); } };
+}
+
+test("item 16: a NARROWED star.yaml refuses every row-serving op on the ordinary (non-cross-star) surface", async () => {
+  const { ctx, cleanup } = await driftVault();
+  try {
+    for (const name of ["recall", "recall_v2"]) {
+      await expect(dispatchToolCall(operations, name, { query: "protein creatine goals" }, ctx)).rejects.toThrow(/scope-hash mismatch/);
+    }
+    await expect(dispatchToolCall(operations, "indexed_page", { id: "keep" }, ctx)).rejects.toThrow(/scope-hash mismatch/);
+    await expect(dispatchToolCall(operations, "hotlist", {}, ctx)).rejects.toThrow(/scope-hash mismatch/);
+    // neighbors and graph are marked served:"fs" to keep them OFF the cross-star surface, but they
+    // answer entirely out of the store — deriving the guard from `served` would have left both
+    // leaking every excluded page's title.
+    await expect(dispatchToolCall(operations, "neighbors", { id: "keep" }, ctx)).rejects.toThrow(/scope-hash mismatch/);
+    await expect(dispatchToolCall(operations, "graph", {}, ctx)).rejects.toThrow(/scope-hash mismatch/);
+  } finally { await cleanup(); }
+}, 30_000);
+
+test("item 16: health stays answerable under the same drift — it REPORTS the disagreement it would otherwise hide", async () => {
+  const { ctx, cleanup } = await driftVault();
+  try {
+    const h = (await dispatchToolCall(operations, "health", {}, ctx)) as
+      { scopeMatches: boolean | null; builtScopeHash: string | null; desiredScopeHash: string | null };
+    expect(h.scopeMatches).toBe(false);
+    expect(h.builtScopeHash).toBe(scopeHash(["raw/**"]));
+    expect(h.desiredScopeHash).toBe(scopeHash(["raw/**", "secrets/**"]));
+  } finally { await cleanup(); }
+}, 30_000);
+
+test("item 16: a valid, UNCHANGED manifest still serves — the guard is not a blanket refusal", async () => {
+  const vault = mkdtempSync(join(tmpdir(), "funes-ops-agree-"));
+  writeFileSync(join(vault, "star.yaml"), 'memory:\n  index_scope:\n    exclude:\n      - "raw/**"\n');
+  writeFileSync(join(vault, "keep.md"), "---\ntitle: Keep\n---\nprotein creatine goals\n");
+  const store = await LibsqlStore.create(new FakeEmbedder(), join(vault, "i.db"));
+  await indexDir(store, vault, vault, { scopeSignature: { hash: scopeHash(["raw/**"]), ignoreScope: false } });
+  const ctx: OperationContext = { remote: true, trust: "untrusted", vault, store, funes: new FunesStore(store, { root: vault }) };
+  try {
+    const res = (await dispatchToolCall(operations, "recall", { query: "protein creatine goals" }, ctx)) as unknown[];
+    expect(res.length).toBeGreaterThan(0);
+  } finally { await store.close(); rmSync(vault, { recursive: true, force: true }); }
+}, 30_000);
+
+test("item 16: a CONFIGLESS vault (no star.yaml) is unaffected — nothing declared, nothing enforced", async () => {
+  const { ctx, cleanup } = await fixture(); // the shared fixture writes no star.yaml
+  try {
+    const res = (await dispatchToolCall(operations, "recall", { query: "protein creatine goals" }, ctx)) as unknown[];
+    expect(res.length).toBeGreaterThan(0); // this store has no scope signature at all, and serves
+  } finally { await cleanup(); }
+});
+
+// ── PLAN-0.3.0 item 18 — DELETION visibility ────────────────────────────────────────────────────
+// The measurable one. `vaultChangedSince` has always taken an `indexedIds` thunk and always had the
+// receiving logic tested with a fake; ALL FIVE production callers passed two arguments, so the thunk
+// was `undefined`, `?? []` made the id set empty, and a note DELETED since the last reindex was
+// invisible — the index went on serving a row whose file was gone, reporting itself fresh forever.
+// An mtime walk cannot see it: a deleted file leaves nothing behind to be newer, which is why this
+// needs the index's own id set and cannot be recovered by walking harder.
+test("item 18: a DELETED note makes recall and health report the vault changed (an mtime walk cannot see it)", async () => {
+  const vault = mkdtempSync(join(tmpdir(), "funes-ops-del-"));
+  writeFileSync(join(vault, "keep.md"), "---\ntitle: Keep\n---\nprotein creatine goals\n");
+  writeFileSync(join(vault, "gone.md"), "---\ntitle: Gone\n---\nprotein creatine elsewhere\n");
+  utimesSync(join(vault, "keep.md"), 1000, 1000);
+  utimesSync(join(vault, "gone.md"), 1000, 1000);
+  const store = await LibsqlStore.create(new FakeEmbedder(), join(vault, "i.db"));
+  await indexDir(store, vault, vault, {}); // both indexed, last_reindex_at stamped
+  // Delete the file and touch NOTHING else: every surviving file stays older than the stamp, so
+  // the mtime half of the answer is "unchanged". Only the id comparison can catch this.
+  rmSync(join(vault, "gone.md"));
+  const ctx: OperationContext = { remote: true, trust: "untrusted", vault, store, funes: new FunesStore(store, { root: vault }) };
+  try {
+    const res = (await dispatchToolCall(operations, "recall", { query: "protein creatine goals" }, ctx)) as Array<Record<string, unknown>>;
+    expect(res.length).toBeGreaterThan(0);
+    expect(res.every((r) => r.vaultChangedSinceReindex === true)).toBe(true);
+    const h = (await dispatchToolCall(operations, "health", {}, ctx)) as { vaultChangedSinceReindex: boolean | null };
+    expect(h.vaultChangedSinceReindex).toBe(true);
+  } finally { await store.close(); rmSync(vault, { recursive: true, force: true }); }
+}, 30_000);
+
+test("item 18: no deletion, nothing touched -> still reported fresh (the id comparison adds no false alarm)", async () => {
+  const vault = mkdtempSync(join(tmpdir(), "funes-ops-nodel-"));
+  writeFileSync(join(vault, "keep.md"), "---\ntitle: Keep\n---\nprotein creatine goals\n");
+  utimesSync(join(vault, "keep.md"), 1000, 1000);
+  const store = await LibsqlStore.create(new FakeEmbedder(), join(vault, "i.db"));
+  await indexDir(store, vault, vault, {});
+  const ctx: OperationContext = { remote: true, trust: "untrusted", vault, store, funes: new FunesStore(store, { root: vault }) };
+  try {
+    const res = (await dispatchToolCall(operations, "recall", { query: "protein creatine goals" }, ctx)) as Array<Record<string, unknown>>;
+    expect(res.length).toBeGreaterThan(0);
+    // The comparison is ONE-directional (an indexed id with no file) precisely so it stays quiet
+    // here: a tombstoned or index_scope-excluded file on disk has no row and must not count.
+    expect(res.some((r) => "vaultChangedSinceReindex" in r)).toBe(false);
+  } finally { await store.close(); rmSync(vault, { recursive: true, force: true }); }
+}, 30_000);
+
+// ── PLAN-0.3.0 item 19 — recall_v2 ──────────────────────────────────────────────────────────────
+test("item 19: recall_v2 returns the identity envelope, and `recall` is UNCHANGED beside it", async () => {
+  const { ctx, cleanup } = await fixture();
+  try {
+    const v1 = (await dispatchToolCall(operations, "recall", { query: "protein creatine goals", k: 5 }, ctx)) as Array<Record<string, unknown>>;
+    const v2 = (await dispatchToolCall(operations, "recall_v2", { query: "protein creatine goals", k: 5 }, ctx)) as {
+      publicationId: string | null; contentGeneration: string | null; generationValid: boolean;
+      servingSignature: string; results: Array<Record<string, unknown>>;
+    };
+    // The envelope's five keys, exactly as the item names them.
+    expect(Object.keys(v2).sort()).toEqual(["contentGeneration", "generationValid", "publicationId", "results", "servingSignature"]);
+    // `results` is the SAME projection `recall` returns — the migration is one key deeper, never a
+    // reparse. This store was filled by remember() with no full build, so there is no content
+    // generation to name and `generationValid` says so rather than inventing one.
+    expect(v2.results.map((r) => r.id)).toEqual(v1.map((r) => r.id));
+    expect(v2.contentGeneration).toBeNull();
+    expect(v2.generationValid).toBe(false);
+    expect(v2.publicationId).toBeNull();
+    expect(v2.servingSignature.startsWith("sv1:")).toBe(true);
+    // recall is RETAINED, not deprecated: retiring it is a twinkl.ing release gate.
+    expect(operations.some((o) => o.name === "recall")).toBe(true);
+  } finally { await cleanup(); }
+});
+
+test("item 19: after a full build, recall_v2 names the content generation and calls it valid", async () => {
+  const vault = mkdtempSync(join(tmpdir(), "funes-ops-v2gen-"));
+  writeFileSync(join(vault, "keep.md"), "---\ntitle: Keep\n---\nprotein creatine goals\n");
+  const store = await LibsqlStore.create(new FakeEmbedder(), join(vault, "i.db"));
+  await indexDir(store, vault, vault, {}); // finalizeReindex stamps the content generation
+  const ctx: OperationContext = { remote: true, trust: "untrusted", vault, store, funes: new FunesStore(store, { root: vault }) };
+  try {
+    const v2 = (await dispatchToolCall(operations, "recall_v2", { query: "protein creatine goals" }, ctx)) as
+      { contentGeneration: string | null; generationValid: boolean };
+    expect(v2.contentGeneration).toMatch(/^v2:/);
+    expect(v2.generationValid).toBe(true);
+  } finally { await store.close(); rmSync(vault, { recursive: true, force: true }); }
+}, 30_000);
+
 test("S3 mutations: remember server-stamps untrusted + writes out_memory; supersede/forget guarded by assertOwned", async () => {
   const { ctx, cleanup } = await fixture();
   try {
@@ -130,13 +333,46 @@ test("health: counts + signature + dirty flag", async () => {
   } finally { await cleanup(); }
 });
 
+test("health: `generation` survives as a DEPRECATED alias of `contentGeneration` — both faces, one name per value", async () => {
+  // This op spreads `stats()`, so item 8's field rename renamed the op's key with it while the HTTP
+  // face `/health` (which names its keys) kept `generation` — one logical value under two names on
+  // two faces, and twinkl.ing's memory block reads `generation` off one of them. Both keys are
+  // present on both faces until the twinkl.ing cutover release drops them together.
+  const { ctx, cleanup } = await fixture();
+  try {
+    const h = (await dispatchToolCall(operations, "health", {}, ctx)) as
+      { generation: string | null; contentGeneration: string | null };
+    expect("generation" in h).toBe(true);
+    expect(h.generation).toBe(h.contentGeneration);
+  } finally { await cleanup(); }
+});
+
+test("item 20: health carries the WHOLE operator state contract, and keeps every key it already had", async () => {
+  const { ctx, cleanup } = await fixture();
+  try {
+    const h = (await dispatchToolCall(operations, "health", {}, ctx)) as Record<string, unknown>;
+    // The item's field list, in one assertion so a field cannot quietly go missing.
+    for (const k of [
+      "schemaVersion", "publicationId", "contentGeneration", "generationValid", "invalidatedAt",
+      "invalidatedReason", "servingSignature", "builtScopeHash", "desiredScopeHash", "scopeMatches",
+      "ignoreScope", "buildState", "machineState", "overrides",
+    ]) expect(h).toHaveProperty(k);
+    // …and the pre-existing keys survive untouched, including the deprecated `generation` alias the
+    // twinkl.ing cutover (item 19) is the only thing allowed to remove.
+    for (const k of ["vault", "nodes", "edges", "embeddingSignature", "reindexDirty", "lastReindexAt", "scopeHash", "generation", "vaultChangedSinceReindex"]) {
+      expect(h).toHaveProperty(k);
+    }
+    expect(h.generation).toBe(h.contentGeneration);
+  } finally { await cleanup(); }
+});
+
 test("dispatch: unknown op and missing required arg both throw; tool defs project all ops", async () => {
   const { ctx, cleanup } = await fixture();
   try {
     await expect(dispatchToolCall(operations, "nope", {}, ctx)).rejects.toThrow(/unknown operation/);
     await expect(dispatchToolCall(operations, "recall", {}, ctx)).rejects.toThrow(/missing required/);
     const defs = buildToolDefs(operations);
-    expect(defs.map((d) => d.name).sort()).toEqual(["forget", "graph", "health", "hotlist", "indexed_page", "neighbors", "page", "recall", "remember", "supersede", "tree"]);
+    expect(defs.map((d) => d.name).sort()).toEqual(["forget", "graph", "health", "hotlist", "indexed_page", "neighbors", "page", "recall", "recall_v2", "remember", "supersede", "tree"]);
     expect(defs.every((d) => d.description.length > 0)).toBe(true);
   } finally { await cleanup(); }
 });
@@ -149,7 +385,9 @@ test("readonly subset (--readonly cross-star query): exposes reads only, never a
   const writes = operations.filter((o) => !o.readonly).map((o) => o.name).sort();
   expect(writes).toEqual(["forget", "remember", "supersede"]);
   for (const w of writes) expect(readOnly).not.toContain(w);
-  expect(readOnly).toEqual(["graph", "health", "hotlist", "indexed_page", "neighbors", "page", "recall", "tree"]);
+  // 0.3.0 item 19: `recall_v2` ships ALONGSIDE `recall`, never replacing it — retiring `recall`
+  // needs a twinkl.ing release, which the plan names as an external release gate.
+  expect(readOnly).toEqual(["graph", "health", "hotlist", "indexed_page", "neighbors", "page", "recall", "recall_v2", "tree"]);
 });
 
 test("hotlist op (R8): tracking off -> {tracking:false, items:[]}; on -> trusted-only counters", async () => {

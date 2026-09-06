@@ -10,8 +10,9 @@
 //   • `libsql` is declared by funes-libsql, NOT by funes-engine, so externalizing it while dropping
 //     the workspace deps would ship a tarball that dies on the stranger's first `reindex`;
 //   • both native deps are EXACT-pinned: hashing one tarball does not freeze what it resolves later,
-//     and a caret would let a future install pull native packages CI never tested.
-import { mkdirSync, rmSync, writeFileSync, readFileSync, copyFileSync, existsSync } from "node:fs";
+//     and a caret would let a future install pull native packages CI never tested. Pinning the two
+//     DIRECT deps is not enough on its own — see the shrinkwrap block near the bottom.
+import { mkdirSync, rmSync, writeFileSync, readFileSync, copyFileSync, existsSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { FUNES_VERSION } from "../packages/funes-engine/src/version.ts";
 import { LIBSQL_ONLY_DEFINE } from "../packages/funes-engine/src/artifact.ts";
@@ -106,7 +107,10 @@ writeFileSync(join(OUT, "package.json"), JSON.stringify({
   repository: { type: "git", url: "git+https://github.com/rainblowing/funes.git" },
   type: "module",
   bin: { funes: "dist/cli.js" },
-  files: ["dist", "README.md", "LICENSE"],
+  // npm-shrinkwrap.json is LOAD-BEARING here. npm force-includes package.json/README/LICENSE
+  // regardless of `files`, but NOT the shrinkwrap — verified with npm 11.17: omit it and `npm pack`
+  // drops it silently, leaving a tarball that looks locked and is not.
+  files: ["dist", "README.md", "LICENSE", "npm-shrinkwrap.json"],
   // ">=22" was a claim the gate did not test: the smoke matrix floors at 22.14 and its own comment
   // says 22.14 is "the floor the manifest's engines field claims". Now it is.
   engines: { node: ">=22.14" },
@@ -128,9 +132,52 @@ for (const f of ["README.md", "LICENSE"]) {
   else process.stderr.write(`build-cli: WARNING — ${f} missing from the staging root\n`);
 }
 
+// Freeze the RESOLVED closure into the tarball (PLAN-0.3.0 P0.1). Exact-pinning the two direct deps
+// stops one version of drift and not the one that matters: everything BELOW them is a range —
+// `@huggingface/tokenizers` and `sharp` are carets under transformers — and the tokenizer decides the
+// token ids, so two machines installing the same SHA-verified tarball can embed the same page into
+// different vectors while claiming one content generation.
+//
+// npm-shrinkwrap.json is the only lockfile that travels: `package-lock.json` is force-EXCLUDED from
+// every tarball, and bun.lock is not a thing npm has ever read. Verified end to end — the registry
+// stamps `_hasShrinkwrap` on the published version and arborist inflates the dependency's subtree
+// from it instead of re-resolving the ranges.
+//
+// This freezes VERSIONS, not the installed tree: the per-platform optional natives (@libsql/*,
+// @img/sharp-*) are meant to differ between macOS and Linux. No byte-identical-tree claim is made.
+const lock = join(OUT, "package-lock.json");
+const shrinkwrap = join(OUT, "npm-shrinkwrap.json");
+const resolved = Bun.spawnSync(
+  ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"],
+  { cwd: OUT, stdout: "pipe", stderr: "pipe" },
+);
+if (resolved.exitCode !== 0 || !existsSync(lock)) {
+  process.stderr.write(new TextDecoder().decode(resolved.stderr));
+  throw new Error("build-cli: could not resolve the dependency closure (npm + network required)");
+}
+// A plain rename, NOT `npm shrinkwrap`. That command falls back to loadActual() when no lockfile is
+// on disk and writes an empty shrinkwrap without failing — a lock that pins nothing, silently. The
+// rename is what it does anyway when a lock IS present: byte-identical output, one less trap.
+renameSync(lock, shrinkwrap);
+
+const sw = JSON.parse(readFileSync(shrinkwrap, "utf8")) as {
+  packages?: Record<string, { version?: string; resolved?: string; integrity?: string }>;
+};
+const closure = Object.entries(sw.packages ?? {}).filter(([k]) => k !== "");
+// onnxruntime-node is named explicitly because it is the reason this block exists: it is the
+// embedding runtime, it appears in no manifest we write, and losing it from the closure is a change
+// to what funes stores — not a packaging detail to discover from a diffed vector months later.
+for (const need of [...Object.keys(EXTERNAL), "onnxruntime-node"]) {
+  const e = sw.packages?.[`node_modules/${need}`];
+  if (!e?.version || !e.resolved) throw new Error(`build-cli: shrinkwrap does not pin ${need}`);
+}
+const loose = closure.filter(([, e]) => !e.version || !e.resolved || !e.integrity).map(([k]) => k);
+if (loose.length) throw new Error(`build-cli: shrinkwrap entries without version+resolved+integrity: ${loose.join(", ")}`);
+
 const kb = Math.round(emitted.length / 1024);
 process.stdout.write(
   `build-cli: ${OUT} — dist/cli.js ${kb}KB, node shebang, v${FUNES_VERSION}\n` +
   `  ${modules.length} modules; no daemon/face/app/console.html/pg; daemon-client present\n` +
+  `  npm-shrinkwrap.json: ${closure.length} packages pinned (versions, not a cross-platform tree)\n` +
   (dead.length ? `  known dead (documented typeof-guard trade, artifact.ts): ${dead.join(", ")}\n` : ""),
 );

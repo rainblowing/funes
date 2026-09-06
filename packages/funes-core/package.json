@@ -1,6 +1,6 @@
 {
   "name": "funes-core",
-  "version": "0.0.1",
+  "version": "0.3.0",
   "description": "Portable hybrid-recall memory engine: schema, RRF fusion, compaction, recall semantics (no storage/runtime deps).",
   "type": "module",
   "module": "src/index.ts",

@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from "node
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import type { Embedder } from "funes-core";
-import { zoneOfDir, zoneOfFile, memoryZoneOf } from "funes-shared";
+import { zoneOfDir, zoneOfFile, trustDefaultOfFile, memoryZoneOf } from "funes-shared";
 import { walkMd } from "./reindex.ts";
 import { fileToItem } from "./markdown.ts";
 import { LibsqlStore } from "../../funes-libsql/src/index.ts";
@@ -40,6 +40,31 @@ test("trust default follows the zone: raw/in_* untrusted, wiki trusted, explicit
   expect(fileToItem(join(root, "raw/in_tg/dump.md"), root).trust).toBe("untrusted");
   expect(fileToItem(join(root, "raw/in_tg/elevated.md"), root).trust).toBe("trusted"); // frontmatter canonical
   expect(fileToItem(join(root, "wiki/page.md"), root).trust).toBe("trusted");
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("trustDefaultOfFile: any out_* segment defaults untrusted; the out/ container root does not", () => {
+  expect(trustDefaultOfFile("out/out_memory/x.md")).toBe("untrusted");
+  expect(trustDefaultOfFile("out_memory/x.md")).toBe("untrusted");             // legacy top-level
+  expect(trustDefaultOfFile("out/out_migrations/2026/m.md")).toBe("untrusted"); // the zone the r5 list forgot
+  expect(trustDefaultOfFile("projects/p/out_decks/d.md")).toBe("untrusted");   // project-attributed, any depth
+  expect(trustDefaultOfFile("out/draft.md")).toBe("trusted");                  // container ≠ zone: a human draft
+  expect(trustDefaultOfFile("out_of_office.md")).toBe("trusted");              // a FILE named out_* is not a zone
+  expect(trustDefaultOfFile("raw/in_tg/x.md")).toBe("untrusted");              // incoming, unchanged
+  expect(trustDefaultOfFile("wiki/page.md")).toBe("trusted");
+  expect(trustDefaultOfFile("top.md")).toBe("trusted");
+});
+
+test("an out_* page defaults untrusted through fileToItem, and frontmatter still wins", () => {
+  const root = mkdtempSync(join(tmpdir(), "funes-trust-"));
+  mkdirSync(join(root, "out/out_digest"), { recursive: true });
+  mkdirSync(join(root, "out"), { recursive: true });
+  writeFileSync(join(root, "out/out_digest/w.md"), "---\ntitle: D\n---\nbody");
+  writeFileSync(join(root, "out/out_digest/elevated.md"), "---\ntitle: E\ntrust: trusted\n---\nbody");
+  writeFileSync(join(root, "out/draft.md"), "---\ntitle: H\n---\nbody");
+  expect(fileToItem(join(root, "out/out_digest/w.md"), root).trust).toBe("untrusted");
+  expect(fileToItem(join(root, "out/out_digest/elevated.md"), root).trust).toBe("trusted");
+  expect(fileToItem(join(root, "out/draft.md"), root).trust).toBe("trusted");
   rmSync(root, { recursive: true, force: true });
 });
 

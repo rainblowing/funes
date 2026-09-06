@@ -29,6 +29,10 @@ export class CrossEncoderReranker implements Reranker {
     this.dtype = dtype;
   }
 
+  /** The serving signature's reranker input (item 7): model AND dtype, because a q8 and an fp32
+   *  copy of one model reorder differently while sharing a name. */
+  get id(): string { return `${this.modelId}:${this.dtype}`; }
+
   private async load(): Promise<{ tokenizer: any; model: any }> {
     if (!this.model) {
       const { AutoTokenizer, AutoModelForSequenceClassification } = await import("@huggingface/transformers");

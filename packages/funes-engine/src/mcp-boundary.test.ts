@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test";
+import { test, expect, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -6,6 +6,7 @@ import type { Embedder } from "funes-core";
 import { LibsqlStore } from "../../funes-libsql/src/index.ts";
 import { scopeHash } from "./scope.ts";
 import { startDaemon } from "./daemon.ts";
+import { FUNES_VERSION } from "./version.ts";
 
 // ── the MCP boundary itself, exercised over real stdio ────────────────────────────────────
 // mcp.ts's `--readonly` filter is what a cross-star (sibling) recall connection relies on: a
@@ -17,6 +18,8 @@ import { startDaemon } from "./daemon.ts";
 
 const MCP = join(import.meta.dir, "mcp.ts");
 const REPO = resolve(import.meta.dir, "..", "..", "..");
+/** The protocol revision funes serves. Pinned here so a spec bump is a deliberate one-line edit. */
+const MODERN_REVISION = "2026-07-28";
 
 class FakeEmbedder implements Embedder {
   readonly dim = 16;
@@ -79,7 +82,9 @@ class McpClient {
     return p;
   }
   notify(method: string, params?: Record<string, unknown>) { this.send({ jsonrpc: "2.0", method, ...(params ? { params } : {}) }); }
-  /** initialize handshake — required before tools/list or tools/call are served. */
+  /** initialize handshake — the 2025-era opening. Still served on SDK v2 (`serveStdio`'s default
+   *  `legacy: 'serve'`), which is why every test below this line needed no change when funes moved
+   *  to protocol revision 2026-07-28. */
   async initialize() {
     await this.request(1, "initialize", {
       protocolVersion: "2024-11-05",
@@ -87,6 +92,19 @@ class McpClient {
       clientInfo: { name: "boundary-test", version: "0" },
     });
     this.notify("notifications/initialized");
+  }
+  /** A 2026-07-28 request: NO handshake at all — the protocol version and the client's capabilities
+   *  ride in a per-request `_meta` envelope. A connection pins to the era of its first accepted
+   *  message, so a client uses this OR `initialize()`, never both. */
+  async modern(id: number, method: string, params: Record<string, unknown> = {}) {
+    return this.request(id, method, {
+      ...params,
+      _meta: {
+        "io.modelcontextprotocol/protocolVersion": MODERN_REVISION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": { name: "boundary-test", version: "0" },
+      },
+    });
   }
   async close() {
     try { await this.reader.cancel(); } catch { /* already closed */ }
@@ -130,7 +148,7 @@ test("mcp --readonly (real spawned stdio): tools/list drops every mutation; a mu
 
     const list = (await client.request(2, "tools/list")) as { result?: { tools: Array<{ name: string }> } };
     const names = (list.result?.tools ?? []).map((t) => t.name).sort();
-    expect(names).toEqual(["graph", "health", "hotlist", "indexed_page", "neighbors", "page", "recall", "tree"]);
+    expect(names).toEqual(["graph", "health", "hotlist", "indexed_page", "neighbors", "page", "recall", "recall_v2", "tree"]);
     for (const w of WRITES) expect(names).not.toContain(w);
 
     // a mutation is refused on tools/call — and the message proves the mcp.ts guard fired, i.e. the
@@ -153,10 +171,17 @@ test("mcp --readonly over the daemon PROXY: the mutation guard runs before daemo
   // registry (remember included), so if the --readonly guard did NOT run on the proxy path, the
   // mutation would proxy through and write. We prove it is refused AND the daemon store is untouched.
   const vault = mkdtempSync(join(tmpdir(), "funes-mcpproxy-vault-"));
+  // Isolated like every other spawn in this file, even though a proxied server opens no store of
+  // its own: when the probe misses the in-process daemon (a cold start under full-suite CPU
+  // contention is enough), mcp.ts falls back to a DIRECT open, and that open lands at
+  // `$FUNES_LIBSQL_DIR/<vault basename>/`. Without this line that base was the real
+  // ~/.twinkling/libsql — two orphaned `funes-mcpproxy-vault-*` homes there are the evidence.
+  const libsqlBase = mkdtempSync(join(tmpdir(), "funes-mcpproxy-idx-"));
   const store = await LibsqlStore.create(new FakeEmbedder()); // in-memory, owned by the in-process daemon
   const server = startDaemon({ vault, store, port: 0 });
   const proc = spawnMcp(["--vault", vault, "--readonly"], {
     FUNES_BACKEND: "libsql",
+    FUNES_LIBSQL_DIR: libsqlBase,
     FUNES_DAEMON_PORT: String(server.port),
   });
   const client = new McpClient(proc);
@@ -174,6 +199,62 @@ test("mcp --readonly over the daemon PROXY: the mutation guard runs before daemo
     await client.close();
     server.stop(true);
     await store.close();
+    rmSync(vault, { recursive: true, force: true });
+    rmSync(libsqlBase, { recursive: true, force: true });
+  }
+}, 45_000);
+
+// ── 0.3.0 item 24 over the PROXY (RAI-148) ────────────────────────────────────────────────────
+// A proxied write carries the DAEMON's own actor: the stdio process's `--actor` applies only when
+// it opens the store directly, and tool arguments never carry one (actor.test.ts). Both halves of
+// "the audit log and the stamped row agree" are asserted — the row through the daemon's store, the
+// audit line through the daemon's stderr, which is THIS process's because the daemon is in-process.
+test("item 24 (PROXY): a proxied remember stamps the daemon's actor, never the stdio --actor, and the audit line names it", async () => {
+  const vault = mkdtempSync(join(tmpdir(), "funes-mcpproxy-vault-"));
+  const store = await LibsqlStore.create(new FakeEmbedder(), undefined, { writeActor: "daemon:ops" });
+  const server = startDaemon({ vault, store, port: 0, actor: "daemon:ops" });
+  const proc = spawnMcp(["--vault", vault, "--actor", "stdio:intruder"], {
+    FUNES_BACKEND: "libsql",
+    FUNES_DAEMON_PORT: String(server.port),
+  });
+  const client = new McpClient(proc);
+  const stderr = spyOn(process.stderr, "write").mockImplementation(() => true);
+  try {
+    await client.initialize();
+    const call = (await client.request(2, "tools/call", {
+      name: "remember",
+      arguments: { title: "Proxied", body: "written through the daemon" },
+    })) as { result?: { isError?: boolean; content?: Array<{ text: string }> } };
+    expect(call.result?.isError).toBeFalsy();
+    const { id } = JSON.parse(call.result?.content?.[0]?.text ?? "{}") as { id: string };
+    expect((await store.indexedPage({ id }))!.writeActor).toBe("daemon:ops");
+    const written = stderr.mock.calls.map((c) => String(c[0]));
+    const audit = written.find((l) => l.includes("write-designation"));
+    expect(audit).toContain("op=remember");
+    expect(audit).toContain("actor=daemon:ops");
+    expect(written.join("")).not.toContain("stdio:intruder"); // the proxy's actor reaches nothing
+  } finally {
+    stderr.mockRestore();
+    await client.close();
+    server.stop(true);
+    await store.close();
+    rmSync(vault, { recursive: true, force: true });
+  }
+}, 45_000);
+
+test("mcp --actor with an unusable name refuses to START (item 24: resolved at startup, fail-closed, before the daemon probe)", async () => {
+  const vault = mkdtempSync(join(tmpdir(), "funes-mcp-actor-bad-"));
+  const proc = spawnMcp(["--vault", vault, "--actor", "bad name"], {
+    FUNES_BACKEND: "libsql",
+    FUNES_LIBSQL_DIR: vault,
+    FUNES_DAEMON_PORT: "1",
+  });
+  try {
+    const err = await drain(proc.stderr as ReadableStream<Uint8Array>);
+    const code = await proc.exited;
+    expect(code).not.toBe(0); // exited before connecting stdio
+    expect(err).toContain("not a usable actor name");
+  } finally {
     rmSync(vault, { recursive: true, force: true });
   }
 }, 45_000);
@@ -285,6 +366,76 @@ test("mcp --ops WITHOUT --cross-star (own-star): an fs op like page IS admitted,
   }
 }, 45_000);
 
+// ── protocol revision 2026-07-28 (the stateless core) ─────────────────────────────────────
+// funes served 2025-11-25 until this migration. The tests above pin that the LEGACY opening still
+// works; these pin the modern one. Both matter: dropping either is a breaking change for somebody.
+
+test("2026-07-28: tools/list with NO handshake — the protocol version rides in the per-request _meta envelope", async () => {
+  const libsqlBase = mkdtempSync(join(tmpdir(), "funes-modern-idx-"));
+  const vault = mkdtempSync(join(tmpdir(), "funes-modern-vault-"));
+  const proc = spawnMcp(["--vault", vault, "--ops", "recall,health"], {
+    FUNES_BACKEND: "libsql", FUNES_LIBSQL_DIR: libsqlBase, FUNES_DAEMON_PORT: "1",
+  });
+  const client = new McpClient(proc);
+  try {
+    // No initialize(), no notifications/initialized — under 2026-07-28 there is no handshake at all.
+    const list = (await client.modern(2, "tools/list")) as { result?: { tools: Array<{ name: string }> } };
+    expect((list.result?.tools ?? []).map((t) => t.name)).toEqual(["recall", "health"]);
+
+    // and the --ops allowlist refusal still fires on the modern era, with the funes wording
+    const page = (await client.modern(3, "tools/call", { name: "page", arguments: { path: "x.md" } })) as
+      { result?: { isError?: boolean; content?: Array<{ text: string }> } };
+    expect(page.result?.isError).toBe(true);
+    expect(page.result?.content?.[0]?.text ?? "").toContain("--ops allowlist");
+  } finally {
+    await client.close();
+    rmSync(libsqlBase, { recursive: true, force: true });
+    rmSync(vault, { recursive: true, force: true });
+  }
+}, 45_000);
+
+test("2026-07-28: server/discover answers in ONE request with the supported revisions (it returned -32601 on SDK v1)", async () => {
+  const libsqlBase = mkdtempSync(join(tmpdir(), "funes-disc-idx-"));
+  const vault = mkdtempSync(join(tmpdir(), "funes-disc-vault-"));
+  const proc = spawnMcp(["--vault", vault, "--ops", "recall,health"], {
+    FUNES_BACKEND: "libsql", FUNES_LIBSQL_DIR: libsqlBase, FUNES_DAEMON_PORT: "1",
+  });
+  const client = new McpClient(proc);
+  try {
+    const d = (await client.modern(2, "server/discover")) as {
+      error?: { code: number }; result?: { supportedVersions?: string[]; capabilities?: Record<string, unknown> };
+    };
+    expect(d.error).toBeUndefined();                                  // -32601 was the v1 behaviour
+    expect(d.result?.supportedVersions ?? []).toContain(MODERN_REVISION);
+    expect(d.result?.capabilities).toHaveProperty("tools");           // funes declares tools and nothing else
+  } finally {
+    await client.close();
+    rmSync(libsqlBase, { recursive: true, force: true });
+    rmSync(vault, { recursive: true, force: true });
+  }
+}, 45_000);
+
+test("the stdio server reports the REAL funes version (the face hardcoded 0.1.0; the two transports must agree)", async () => {
+  const libsqlBase = mkdtempSync(join(tmpdir(), "funes-ver-idx-"));
+  const vault = mkdtempSync(join(tmpdir(), "funes-ver-vault-"));
+  const proc = spawnMcp(["--vault", vault, "--ops", "health"], {
+    FUNES_BACKEND: "libsql", FUNES_LIBSQL_DIR: libsqlBase, FUNES_DAEMON_PORT: "1",
+  });
+  const client = new McpClient(proc);
+  try {
+    const init = (await client.request(1, "initialize", {
+      protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" },
+    })) as { result?: { serverInfo?: { name: string; version: string } } };
+    expect(init.result?.serverInfo?.name).toBe("funes");
+    expect(init.result?.serverInfo?.version).toBe(FUNES_VERSION);
+    expect(init.result?.serverInfo?.version).not.toBe("0.1.0");
+  } finally {
+    await client.close();
+    rmSync(libsqlBase, { recursive: true, force: true });
+    rmSync(vault, { recursive: true, force: true });
+  }
+}, 45_000);
+
 // ── serve-time index_scope guard (--ops cross-star mode) ──────────────────────────────────
 // The index_scope boundary must hold at SERVE time, not just at build: scope can drift after a
 // build (star.yaml edited without reindex; an --ignore-scope build). These drive mcp.ts over the
@@ -307,8 +458,9 @@ async function scopeDaemonFixture(opts: { excludes: string[]; persist?: { hash: 
 }
 
 async function opsRecall(port: number, vault: string, query: string) {
-  // --cross-star: the scope guard is a cross-star concern (H8/H9) — an own-star --ops binding is not
-  // scope-guarded, so the guard tests must declare the cross-star surface.
+  // --cross-star: these cases exercise the CROSS-STAR expectation specifically (an absent/invalid
+  // manifest refuses, and a rebuild in progress refuses), which is stricter than the own-star one
+  // that 0.3.0 item 16 now applies everywhere — so they declare the cross-star surface.
   const proc = spawnMcp(["--vault", vault, "--ops", "recall,indexed_page,health", "--cross-star"], { FUNES_BACKEND: "libsql", FUNES_DAEMON_PORT: String(port) });
   const client = new McpClient(proc);
   await client.initialize();
@@ -328,17 +480,21 @@ test("scope guard (--ops): a MISSING scope signature refuses cross-star recall; 
   } finally { await f.cleanup(); }
 }, 45_000);
 
-test("scope guard (--ops): scope DRIFT (hash mismatch) refuses cross-star recall, but a plain daemon recall still works", async () => {
+test("scope guard (0.3.0 item 16): scope DRIFT (hash mismatch) refuses the PLAIN daemon recall as well as the cross-star one", async () => {
   // index stamped for [built/**]; star.yaml now declares [current/**] -> the hashes differ.
   const f = await scopeDaemonFixture({ excludes: ["current/**"], persist: { hash: scopeHash(["built/**"]), ignoreScope: false }, content: true });
   try {
-    // the index itself is fine — a plain daemon recall (NOT scope-guarded) returns results
+    // INVERTED BY PLAN-0.3.0 item 16, and the inversion is the point of the item. This case used to
+    // assert that "a plain daemon recall (NOT scope-guarded) returns results" — i.e. that an
+    // operator who narrowed star.yaml and had not yet reindexed went on serving the pages they had
+    // just withdrawn, to every local client, forever, with the guard running only for FOREIGN
+    // callers. The old assertion documented the hole rather than a property worth keeping.
     const direct = (await (await fetch(`http://127.0.0.1:${f.server.port}/api/recall`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ query: "kept alpha tokens" }),
-    })).json()) as { ok: boolean; result: unknown[] };
-    expect(direct.ok).toBe(true);
-    expect(direct.result.length).toBeGreaterThan(0);
-    // but the cross-star --ops path refuses on the drift
+    })).json()) as { ok: boolean; error?: string; result?: unknown[] };
+    expect(direct.ok).toBe(false);
+    expect(direct.error ?? "").toContain("scope-hash mismatch");
+    // and the cross-star --ops path refuses on the same drift, as it always did
     const { recall } = await opsRecall(f.server.port!, f.vault, "kept alpha tokens");
     expect(recall.result?.isError).toBe(true);
     expect(recall.result?.content?.[0]?.text ?? "").toContain("scope-hash mismatch");
@@ -376,7 +532,7 @@ test("H9 barrier (PROXY): a reindex in progress on the daemon store refuses the 
     expect(recall.result?.isError).toBe(true);
     expect(recall.result?.content?.[0]?.text ?? "").toContain("reindex is in progress");
     expect(health.result?.isError).toBeFalsy(); // health stays exempt so the operator can diagnose
-    await f.store.endReindex();
+    await f.store.finalizeReindex({ contentGeneration: "v2:" + "f".repeat(64) });
   } finally { await f.cleanup(); }
 }, 45_000);
 

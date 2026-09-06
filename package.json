@@ -13,7 +13,7 @@
     "lint:dag": "bun scripts/lint-package-dag.ts"
   },
   "devDependencies": {
-    "@types/bun": "latest",
-    "typescript": "^5"
+    "@types/bun": "^1.4.0",
+    "typescript": "7.0.2"
   }
 }

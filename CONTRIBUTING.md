@@ -34,8 +34,12 @@ Both are enforced by lints wired into `bun run test`, so CI will tell you before
   ranking, you re-baseline the goldens *in the same commit* and say why in the message. Ranking
   changes should be justified against the judged fixture (per-set metrics with a frozen holdout),
   not tuned on the holdout.
-- **Index-schema changes bump `INDEX_SCHEMA_VERSION`** and ship a migration path (libSQL migrates
-  additively on a writer open; a read-only handle refuses rather than silently serving a stale shape).
+- **Index-schema changes bump `INDEX_SCHEMA_VERSION`, and that version is a FENCE, not a ladder.**
+  Since 0.3.0 libSQL does not migrate in place: a read-only open dual-reads the previous version and
+  the current one, a read-write open accepts only the current one and refuses everything else by
+  naming the repair. The path forward is a REBUILD — `funes reindex --fresh` for a live index,
+  `funes publish` for a served home — because the index is derived (ADR-0003) and a migration ladder
+  let an old writer mutate a new artefact without invalidating its content generation.
 
 ## Commits
 

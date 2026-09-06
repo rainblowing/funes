@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Embedder } from "funes-core";
+import { GENERATION_VERSION } from "funes-shared";
 import { coordinationDir, withCoordination } from "./coordination.ts";
 import { FunesStore } from "./funes-store.ts";
 import { indexDir } from "./reindex.ts";
@@ -62,7 +63,7 @@ test("coordination: env set -> remember/supersede/reindex acquire the shared loc
 
     // reindex (the other funes write path) also runs under the lock
     await indexDir(store, vault, vault, {});
-    expect((await store.stats()).generation).toMatch(/^v1:/);
+    expect((await store.stats()).contentGeneration).toMatch(new RegExp(`^${GENERATION_VERSION}:`));
 
     // and the lock is RELEASED after each path: an immediate re-acquire succeeds
     await withCoordination(async () => 1);

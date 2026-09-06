@@ -1,6 +1,12 @@
 import { test, expect } from "bun:test";
+import { Database as BunDatabase } from "bun:sqlite";
 import type { Embedder } from "funes-core";
-import { funesBackend, funesDbDir, makeStore } from "./factory.ts";
+import { INDEX_SCHEMA_VERSION } from "funes-shared";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { funesBackend, funesDbDir, makeStore, repairIndexForFresh } from "./factory.ts";
+import { LibsqlStore } from "../../funes-libsql/src/index.ts";
 
 // FUNES_BACKEND seam: default libsql (the only local backend since PGLite was removed 2026-07-20),
 // backend-aware dbDir, and a clear connection-string error for the deferred postgres profile-B.
@@ -166,15 +172,25 @@ test("makeStore: legacy bare-path marker is honored, then upgraded once the star
   }
 });
 
-test("makeStore: postgres backend requires a connection string (FUNES_PG_URL or opts.pgUrl)", async () => {
-  const saved = process.env.FUNES_PG_URL;
+test("makeStore: postgres is PARKED (0.3.0 P0.4) — refused unless FUNES_PG_UNSAFE=1, then wants a connection string", async () => {
+  const savedUrl = process.env.FUNES_PG_URL;
+  const savedUnsafe = process.env.FUNES_PG_UNSAFE;
   try {
     delete process.env.FUNES_PG_URL;
+    delete process.env.FUNES_PG_UNSAFE;
+    // The refusal must name the escape, or an operator has nowhere to go from the error.
+    await expect(makeStore({ backend: "postgres", embedder: new FakeEmbedder() }))
+      .rejects.toThrow(/parked for 0\.3\.0[\s\S]*FUNES_PG_UNSAFE=1/);
+    // Escape set (the live smoke test's posture): the tier opens again and the NEXT gate is the
+    // connection string, exactly as before the park — so CI's pg coverage is untouched.
+    process.env.FUNES_PG_UNSAFE = "1";
     await expect(makeStore({ backend: "postgres", embedder: new FakeEmbedder() })).rejects.toThrow(/FUNES_PG_URL/);
     expect(funesBackend("postgres")).toBe("postgres");
   } finally {
-    if (saved === undefined) delete process.env.FUNES_PG_URL;
-    else process.env.FUNES_PG_URL = saved;
+    if (savedUrl === undefined) delete process.env.FUNES_PG_URL;
+    else process.env.FUNES_PG_URL = savedUrl;
+    if (savedUnsafe === undefined) delete process.env.FUNES_PG_UNSAFE;
+    else process.env.FUNES_PG_UNSAFE = savedUnsafe;
   }
 });
 
@@ -185,4 +201,92 @@ test("postgresDriver: builds the full PgDriver surface without connecting (pool 
   expect(typeof d.exec).toBe("function");
   expect(typeof d.transaction).toBe("function");
   await d.close();
+});
+
+// 0.3.0 item 23 — the guard runs at the ONE construction point, on the INDEX path.
+// The live estate arrangement is the second case and it must keep opening: the funes repo itself is
+// a Syncthing folder (it carries a .stfolder) while its index lives at ~/.twinkling/libsql/funes.
+test("makeStore: refuses an index inside a sync root; a vault inside one with an off-root index opens", async () => {
+  const tmp = (n: string) => mkdtempSync(join(realpathSync(tmpdir()), n));
+  const synced = tmp("funes-factory-synced-");
+  writeFileSync(join(synced, ".stfolder"), "");
+  await expect(makeStore({ dbDir: join(synced, "libsql", "index.db"), backend: "libsql", embedder: new FakeEmbedder() }))
+    .rejects.toThrow(/refusing to open an index inside a Syncthing root/);
+
+  const vault = tmp("funes-factory-vault-");           // the star, replicated by Syncthing
+  writeFileSync(join(vault, ".stfolder"), "");
+  const home = join(tmp("funes-factory-twinkling-"), "libsql", "funes"); // ~/.twinkling/libsql/<star>
+  mkdirSync(home, { recursive: true });
+  const store = await makeStore({ vault, dbDir: join(home, "index.db"), backend: "libsql", embedder: new FakeEmbedder() });
+  await store.close();
+});
+
+// ── reindex --fresh's pre-open repair (0.3.0 schema fence, PLAN-0.3.0 R2#2) ──────────────────────
+// The fence makes a read-write open REFUSE a stale schema_version, and --fresh used to wipe INSIDE
+// the open store — so the repair verb refused its own patient. repairIndexForFresh removes the
+// files before the open, but only after the checks an open runs, in their order; every case below
+// asserts on the FILE, because the guard that matters is "refused before removal, not after".
+
+/** A built one-page index at `dbPath` (WAL, as a live index is). */
+async function builtIndex(dbPath: string): Promise<void> {
+  const s = await LibsqlStore.create(new FakeEmbedder(), dbPath);
+  await s.remember([{ id: "wiki/a", path: "wiki/a.md", title: "A", body: "a body", trust: "trusted" }]);
+  await s.close();
+}
+function setMeta(dbPath: string, key: string, value: string): void {
+  const raw = new BunDatabase(dbPath);
+  raw.run("insert into meta(key,value) values (?,?) on conflict(key) do update set value=excluded.value", [key, value]);
+  raw.close();
+}
+const freshFixture = () => ({
+  vault: mkdtempSync(join(tmpdir(), "funes-fresh-vault-")),
+  dbPath: join(mkdtempSync(join(tmpdir(), "funes-fresh-idx-")), "index.db"),
+});
+
+test("fresh repair: a current index is KEPT; a \"3\" live index is removed and rebuilt as \"4\"", async () => {
+  const { vault, dbPath } = freshFixture();
+  const embedder = new FakeEmbedder();
+  await builtIndex(dbPath);
+  // Current and matching: nothing to repair — the ordinary in-epoch wipe (prune([])) handles it and
+  // keeps the dirty marker over the rebuild. Removing here would drop that protection for nothing.
+  expect(await repairIndexForFresh({ vault, dbPath, embedder })).toBe("kept");
+  expect(existsSync(dbPath)).toBe(true);
+  setMeta(dbPath, "schema_version", "3");
+  await expect(LibsqlStore.create(embedder, dbPath)).rejects.toThrow(/reindex --fresh/); // the patient the open refuses
+  expect(await repairIndexForFresh({ vault, dbPath, embedder })).toBe("removed");
+  expect(existsSync(dbPath)).toBe(false);
+  expect(existsSync(dbPath + "-wal")).toBe(false); // the sidecars go with it — a stray -wal over a new file is a torn index
+  const rebuilt = await LibsqlStore.create(embedder, dbPath);
+  try { expect((await rebuilt.stats()).schemaVersion).toBe(INDEX_SCHEMA_VERSION); } finally { await rebuilt.close(); }
+});
+
+test("fresh repair: a mismatched embedding signature is removed and rebuilt", async () => {
+  const { vault, dbPath } = freshFixture();
+  const embedder = new FakeEmbedder();
+  await builtIndex(dbPath);
+  setMeta(dbPath, "embedding_signature", "someone-else:8:chunk");
+  await expect(LibsqlStore.create(embedder, dbPath)).rejects.toThrow(/embedding drift/); // the H1 refusal
+  expect(await repairIndexForFresh({ vault, dbPath, embedder })).toBe("removed");
+  expect(existsSync(dbPath)).toBe(false);
+  const rebuilt = await LibsqlStore.create(embedder, dbPath);
+  try { expect((await rebuilt.stats()).schemaVersion).toBe(INDEX_SCHEMA_VERSION); } finally { await rebuilt.close(); }
+});
+
+test("fresh repair: a FOREIGN owner marker is refused BEFORE removal — the file survives", async () => {
+  const { vault, dbPath } = freshFixture();
+  writeFileSync(join(vault, "star.yaml"), "meta:\n  id: star:mine\n");
+  writeFileSync(join(dirname(dbPath), "owner-vault"), JSON.stringify({ id: "star:theirs", vault: "/elsewhere" }) + "\n");
+  await builtIndex(dbPath);
+  setMeta(dbPath, "schema_version", "3"); // stale, so the only thing standing between it and rm is the guard
+  await expect(repairIndexForFresh({ vault, dbPath, embedder: new FakeEmbedder() })).rejects.toThrow(/index collision/);
+  expect(existsSync(dbPath)).toBe(true);
+});
+
+test("fresh repair: an index home under a .stfolder marker is refused before removal — the file survives", async () => {
+  const { vault, dbPath } = freshFixture();
+  await builtIndex(dbPath);
+  setMeta(dbPath, "schema_version", "3");
+  writeFileSync(join(dirname(dbPath), ".stfolder"), ""); // the home itself is a Syncthing folder
+  await expect(repairIndexForFresh({ vault, dbPath, embedder: new FakeEmbedder() })).rejects.toThrow(/Syncthing root/);
+  expect(existsSync(dbPath)).toBe(true);
 });

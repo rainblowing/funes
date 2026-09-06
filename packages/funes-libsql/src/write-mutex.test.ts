@@ -65,7 +65,7 @@ test("full reindex flow holds ONE lock across begin→remember→prune→end, th
   await s.remember([item]);                              // reentrant — no self-deadlock
   await s.prune([item.id]);
   expect(existsSync(lockPathFor(dbPath))).toBe(true);   // still held
-  await s.endReindex();
+  await s.finalizeReindex({ contentGeneration: "v2:" + "f".repeat(64) });
   expect(existsSync(lockPathFor(dbPath))).toBe(false);  // released with the dirty-marker clear
   await s.close();
 });

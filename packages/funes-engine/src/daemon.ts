@@ -16,6 +16,7 @@ import type { FunesIndexStore } from "./store.ts";
 import { makeStore, funesBackend, funesDbDir } from "./factory.ts";
 import { DEFAULT_DAEMON_PORT } from "./daemon-client.ts";
 import { buildApp } from "./app.ts";
+import { resolveWriteActor, UNKNOWN_ACTOR } from "./actor.ts";
 import type { PolicyHeaders } from "funes-api";
 import consoleHtml from "./console.html" with { type: "text" };
 
@@ -44,6 +45,10 @@ export interface DaemonOpts {
   /** P1.5: opt-in scoped-write capability. When set, mutations require a matching
    *  x-funes-capability header on top of the built-in CSRF/content guards. */
   capabilityPath?: string;
+  /** 0.3.0 item 24: THIS daemon's actor, for the dispatch context. The caller constructs `store`
+   *  with the same value as its `writeActor`, so the audit line and the stamped row agree. A
+   *  proxied write (mcp.ts → this daemon) carries the daemon's actor, never the proxy's. */
+  actor?: string;
 }
 
 /** Start the HTTP daemon. Exported for tests (inject a fake-embedder store, port 0). The store→Hono
@@ -66,6 +71,7 @@ export function startDaemon(opts: DaemonOpts) {
       rerank: opts.rerank,
       consoleHtml: consoleHtml as unknown as string,
       authorizeWrite: opts.capabilityPath ? capabilityAuthorizer(opts.capabilityPath) : undefined,
+      actor: opts.actor,
     }).fetch,
   });
   for (const h of ["127.0.0.1", "localhost", "[::1]"]) allowedHosts.push(`${h}:${server.port}`);
@@ -91,9 +97,18 @@ if (import.meta.main) {
   // so the no-flag daemon never touches the ~23MB onnx model. Mirrors the CLI `--rerank`.
   const rerank = argv.includes("--rerank");
   const capabilityPath = flag("--capability");
-  const store = await makeStore({ vault, dbDir, backend, trackRecalls: stats, rerank }); // vault -> collision/identity guard runs; dirty index -> loud error (repair = CLI reindex)
-  const server = startDaemon({ vault, store, port, rerank, capabilityPath });
-  console.log(`funes daemon: ${vault}  [backend=${backend}]${stats ? "  (recall telemetry ON)" : ""}${rerank ? "  (rerank ON)" : ""}${capabilityPath ? "  (write capability REQUIRED)" : ""}`);
+  // 0.3.0 item 24: resolved ONCE, here, from `--actor` over FUNES_ACTOR — the resolver the HTTP face
+  // uses (face.ts). It goes to BOTH places a write's actor is read: the store constructor (the
+  // stamped `write_actor`) and the dispatch context (the designation audit line), so the two
+  // cannot name different actors for one write. A mapping file stays a face concern.
+  const actor = resolveWriteActor({ actor: flag("--actor") });
+  const store = await makeStore({ vault, dbDir, backend, trackRecalls: stats, rerank, writeActor: actor }); // vault -> collision/identity guard runs; dirty index -> loud error (repair = CLI reindex)
+  const server = startDaemon({ vault, store, port, rerank, capabilityPath, actor });
+  console.log(
+    `funes daemon: ${vault}  [backend=${backend}]${stats ? "  (recall telemetry ON)" : ""}${rerank ? "  (rerank ON)" : ""}${capabilityPath ? "  (write capability REQUIRED)" : ""}` +
+    // Stated at startup because "unknown" is a legitimate and otherwise SILENT outcome.
+    `  [actor: ${actor}]${actor === UNKNOWN_ACTOR ? " (no trusted source — writes stamp unknown)" : ""}`,
+  );
   console.log(`  console http://127.0.0.1:${server.port}/  ·  api http://127.0.0.1:${server.port}/api/{recall,page,tree,health}`);
 
   // Graceful shutdown — CLOSE PGLite cleanly on SIGTERM/SIGINT. Without this, `launchctl bootout`

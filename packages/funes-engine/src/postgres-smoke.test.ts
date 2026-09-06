@@ -14,6 +14,21 @@ import { makeStore } from "./factory.ts";
 
 const PG = process.env.FUNES_PG_URL;
 const live = test.skipIf(!PG);
+// 0.3.0 P0.4 parked the postgres backend in makeStore. This IS the coverage the park is willing to
+// keep — a throwaway cluster, no content generation to protect — so it sets the escape itself.
+// Set per-open rather than at module scope: Bun runs a whole test FILE SET in one process, so a
+// module-scope assignment would un-park postgres for every file imported after this one on any
+// machine that exports FUNES_PG_URL. Blast radius is the calls that need it.
+function withPgEscape<T>(fn: () => T): T {
+  const prev = process.env.FUNES_PG_UNSAFE;
+  process.env.FUNES_PG_UNSAFE = "1";
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.FUNES_PG_UNSAFE;
+    else process.env.FUNES_PG_UNSAFE = prev;
+  }
+}
 
 // Deterministic fake embedder (dim 8) — this smoke test validates SQL round-trips + provenance, not
 // semantic ranking, so a real E5 download is unnecessary. "alpha"/"beta" get distinct vectors.
@@ -36,7 +51,7 @@ async function freshStore(writeActor?: string) {
   const { postgresDriver } = await import("./postgres-driver.ts");
   const d = await postgresDriver(PG!);
   for (const t of ["nodes", "edges", "chunks", "recall_stats", "meta"]) await d.exec(`drop table if exists ${t} cascade;`);
-  return makeStore({ backend: "postgres", pgUrl: PG, embedder: new FakeEmbedder(), writeActor });
+  return withPgEscape(() => makeStore({ backend: "postgres", pgUrl: PG, embedder: new FakeEmbedder(), writeActor }));
 }
 
 live("pg smoke: remember + recall round-trips (create extension/table/index all execute)", async () => {

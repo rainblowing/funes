@@ -2,7 +2,8 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalizeScopeExcludes, readIndexScopeExcludes, crossStarExpectedHash, scopeHash, buildScopeExclude, scopeRefusalReason } from "./scope.ts";
+import { canonicalizeScopeExcludes, readIndexScopeExcludes, crossStarExpectedHash, scopeHash, buildScopeExclude, scopeRefusalReason, configlessExclude, ownStarExpectation, crossStarExpectation } from "./scope.ts";
+import { expectationRefusal } from "funes-core";
 
 // Pure index_scope helpers: parse star.yaml excludes, the canonical scope hash, the Bun.Glob
 // predicate (twinkling-parity semantics), and the cross-star serve-time refusal decision.
@@ -100,4 +101,72 @@ test("scopeRefusalReason: holds when hash matches + not ignored; refuses on miss
   expect(scopeRefusalReason(null, h)).toContain("no index_scope signature"); // missing -> fail closed
   expect(scopeRefusalReason({ hash: h, ignoreScope: true }, h)).toContain("--ignore-scope");
   expect(scopeRefusalReason({ hash: h, ignoreScope: false }, scopeHash(["other/**"]))).toContain("scope-hash mismatch");
+});
+
+// ADR-0006: the bundle returned in-star, so a configless reindex must skip it — at any depth.
+test("configlessExclude skips out_okf wherever it sits", () => {
+  const skip = configlessExclude();
+  expect(skip("out_okf/concepts/alpha.md")).toBe(true);
+  expect(skip("sub/out_okf/index.md")).toBe(true);
+  expect(skip("notes/alpha.md")).toBe(false);
+});
+
+
+// ── PLAN-0.3.0 item 16 — desired scope, recomputed from LIVE star.yaml on every check ────────────
+// Own-star and cross-star ask the same question of the built scope and DIFFERENT questions of the
+// manifest, and collapsing the two would have broken one of them: enforcing the cross-star rules
+// own-star refuses every configless vault; enforcing the own-star rules cross-star lets an
+// ungoverned boundary serve.
+test("item 16: ownStarExpectation — absent manifest is NOT a refusal (configless vaults keep serving)", () => {
+  const v = mkdtempSync(join(tmpdir(), "funes-own-absent-"));
+  try {
+    expect(ownStarExpectation(v)()).toBeNull();
+    // …while the SAME vault is refused on a governed cross-star boundary.
+    expect(crossStarExpectation(v)()).toHaveProperty("refusal");
+  } finally { rmSync(v, { recursive: true, force: true }); }
+});
+
+test("item 16: ownStarExpectation — an INVALID manifest fails closed, a valid one yields the live hash", () => {
+  const bad = mkdtempSync(join(tmpdir(), "funes-own-bad-"));
+  writeFileSync(join(bad, "star.yaml"), "memory:\n  index_scope:\n    exclude: not-a-list\n");
+  try {
+    expect((ownStarExpectation(bad)() as { refusal: string }).refusal).toContain("invalid");
+  } finally { rmSync(bad, { recursive: true, force: true }); }
+
+  const ok = mkdtempSync(join(tmpdir(), "funes-own-ok-"));
+  writeFileSync(join(ok, "star.yaml"), 'memory:\n  index_scope:\n    exclude:\n      - "raw/**"\n');
+  try {
+    // refuseWhileDirty is FALSE own-star on purpose: at the moment a local rebuild starts the built
+    // scope still equals the policy that produced it, so a dirty refusal would take the operator's
+    // own daemon down for the length of every reindex and withhold nothing.
+    expect(ownStarExpectation(ok)()).toEqual({ hash: scopeHash(["raw/**"]), refuseWhileDirty: false });
+    expect(crossStarExpectation(ok)()).toEqual({ hash: scopeHash(["raw/**"]), refuseWhileDirty: true });
+  } finally { rmSync(ok, { recursive: true, force: true }); }
+});
+
+test("item 16: the expectation is re-read from disk on every call — a mid-read star.yaml edit is seen", () => {
+  const v = mkdtempSync(join(tmpdir(), "funes-own-live-"));
+  writeFileSync(join(v, "star.yaml"), 'memory:\n  index_scope:\n    exclude:\n      - "raw/**"\n');
+  try {
+    const expect_ = ownStarExpectation(v);
+    expect(expect_()).toEqual({ hash: scopeHash(["raw/**"]), refuseWhileDirty: false });
+    // narrow it, exactly as an operator editing the manifest during a long recall would
+    writeFileSync(join(v, "star.yaml"), 'memory:\n  index_scope:\n    exclude:\n      - "raw/**"\n      - "secrets/**"\n');
+    expect(expect_()).toEqual({ hash: scopeHash(["raw/**", "secrets/**"]), refuseWhileDirty: false });
+  } finally { rmSync(v, { recursive: true, force: true }); }
+});
+
+test("item 16: expectationRefusal — equal hash AND ignoreScope=false is the ONLY serving state", () => {
+  const h = scopeHash(["raw/**"]);
+  const clean = { scopeHash: h, ignoreScope: false, reindexDirty: false };
+  expect(expectationRefusal(clean, { hash: h, refuseWhileDirty: false })).toBeNull();
+  expect(expectationRefusal(clean, null)).toBeNull();                       // nothing declared -> nothing to enforce
+  expect(expectationRefusal(clean, { refusal: "nope" })).toBe("nope");      // a refusal passes straight through
+  expect(expectationRefusal({ ...clean, ignoreScope: true }, { hash: h, refuseWhileDirty: false })).toContain("--ignore-scope");
+  expect(expectationRefusal({ ...clean, scopeHash: null }, { hash: h, refuseWhileDirty: false })).toContain("no index_scope signature");
+  expect(expectationRefusal(clean, { hash: scopeHash(["other/**"]), refuseWhileDirty: false })).toContain("scope-hash mismatch");
+  // dirty refuses ONLY for the cross-star posture
+  const dirty = { ...clean, reindexDirty: true };
+  expect(expectationRefusal(dirty, { hash: h, refuseWhileDirty: true })).toContain("reindex is in progress");
+  expect(expectationRefusal(dirty, { hash: h, refuseWhileDirty: false })).toBeNull();
 });

@@ -32,7 +32,7 @@ test("resolveExposedOps: duplicate names dedupe, first occurrence wins", () => {
 
 test("resolveExposedOps: --readonly (no allowlist) = the read-only subset; unrestricted = the full registry", () => {
   expect(names(resolveExposedOps(operations, { readonly: true, ops: null })).sort())
-    .toEqual(["graph", "health", "hotlist", "indexed_page", "neighbors", "page", "recall", "tree"]);
+    .toEqual(["graph", "health", "hotlist", "indexed_page", "neighbors", "page", "recall", "recall_v2", "tree"]);
   expect(resolveExposedOps(operations, { readonly: false, ops: null }).length).toBe(operations.length);
 });
 

@@ -41,7 +41,7 @@ async function buildIndex(): Promise<string> {
   const p = join(dir, "index.db");
   const rw = await LibsqlStore.create(new FakeEmbedder(), p);
   await rw.remember(ITEMS);
-  await rw.setGeneration("v1:" + "a".repeat(64));
+  await rw.finalizeReindex({ contentGeneration: "v2:" + "a".repeat(64) });
   await rw.finalizeForPublish(); // same-handle by design (a 2nd connection is SQLITE_BUSY until GC)
   await rw.close();
   return p;
@@ -64,7 +64,7 @@ test("RO open: recall/stats/indexedPage serve; writes refuse with a CLEAR error;
   expect(res[0]!.id).toBe("sourdough");
   const st = await s.stats();
   expect(st.nodes).toBe(2);
-  expect(st.generation).toBe("v1:" + "a".repeat(64));
+  expect(st.contentGeneration).toBe("v2:" + "a".repeat(64));
   expect((await s.indexedPage({ id: "telescope" }))?.title).toBe("Telescope");
   expect(s.recallTracking).toBe(false); // telemetry forced OFF — recordRecalls is a write
 
@@ -110,11 +110,11 @@ test("RW open F3: opening an EXISTING finalized (DELETE) db leaves it DELETE, no
   await ro.close();
 });
 
-test("RO open F7: EVERY mutating entry point refuses — endReindex/setGeneration/set+clearScopeSignature/finalize too", async () => {
+test("RO open F7: EVERY mutating entry point refuses — finalizeReindex/setPublicationId/set+clearScopeSignature/finalize too", async () => {
   const p = await buildIndex();
   const s = await LibsqlStore.create(new FakeEmbedder(), p, { readonly: true });
-  await expect(s.endReindex()).rejects.toThrow(/READ-ONLY/);
-  await expect(s.setGeneration("v1:" + "b".repeat(64))).rejects.toThrow(/READ-ONLY/);
+  await expect(s.finalizeReindex({ contentGeneration: "v2:" + "b".repeat(64) })).rejects.toThrow(/READ-ONLY/);
+  await expect(s.setPublicationId("pub:" + "b".repeat(32))).rejects.toThrow(/READ-ONLY/);
   await expect(s.setScopeSignature({ hash: "deadbeef", ignoreScope: false })).rejects.toThrow(/READ-ONLY/);
   await expect(s.clearScopeSignature()).rejects.toThrow(/READ-ONLY/);
   await expect(s.finalizeForPublish()).rejects.toThrow(/READ-ONLY/);

@@ -1,17 +1,20 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Embedder } from "funes-core";
+import { INDEX_SCHEMA_VERSION } from "funes-shared";
 import { makeFaceDeps } from "./face.ts";
-import { publishReindex } from "./publication.ts";
+import { publishReindex, readGenerationManifest } from "./publication.ts";
 import { LibsqlStore } from "../../funes-libsql/src/index.ts";
 
 // makeFaceDeps — the production store resolution (publication-home unify + RO read face,
-// 2026-07-16). Pins: the face engages the PUBLISHED generation at the SAME home the publisher
-// writes; a face booted in DIRECT mode adopts a later publish without restart (the split-home bug:
-// broker homed at /index/star, sidecar publishing /index — silent direct mode forever); the read
-// face's stores are READ-ONLY (writes refuse); read faces refuse non-libsql backends at startup.
+// 2026-07-16; DIRECT removed 0.3.0 item 15). Pins: the face engages the PUBLISHED generation at the
+// SAME home the publisher writes; a home with nothing published REFUSES at startup rather than
+// serving the live index.db next to it (the split-home bug — broker homed at /index/star, sidecar
+// publishing /index — used to be a silent DIRECT mode forever, and is now a refusal naming both
+// paths); the read face's stores are READ-ONLY (writes refuse); read faces refuse non-libsql
+// backends at startup.
 
 class FakeEmbedder implements Embedder {
   readonly dim = 16;
@@ -57,6 +60,29 @@ test("makeFaceDeps: a read face on postgres refuses at startup — readonly face
   });
 });
 
+test("makeFaceDeps item 15: the BROKER face on postgres refuses too — no served face falls back to a live index", async () => {
+  // The hole: item 15's refusal only covered the read face, so the broker fell through to a live
+  // `makeStore` announcing "mode DIRECT" — the mode item 15 removed — and
+  // `FUNES_BACKEND=postgres FUNES_PG_UNSAFE=1 funes face` served it. It must refuse before it opens
+  // anything, whether or not FUNES_PG_UNSAFE is set (that flag gates the STORE, not servability).
+  const savedUnsafe = process.env.FUNES_PG_UNSAFE;
+  try {
+    process.env.FUNES_PG_UNSAFE = "1";
+    await withBackend("postgres", async () => {
+      const err = await makeFaceDeps(makeVault(), { face: "broker", embedder }).then(() => null, (e: Error) => e);
+      expect(err).not.toBeNull();
+      expect(err!.message).toMatch(/refusing to serve a broker face on the postgres backend/); // the problem
+      expect(err!.message).toMatch(/libsql-only/);                                             // the rule
+      expect(err!.message).toMatch(/PARKED for 0\.3\.0/);                                      // the reason
+      expect(err!.message).toMatch(/FUNES_BACKEND=libsql/);                                    // what to do instead
+      expect(err!.message).not.toMatch(/DIRECT/);
+    });
+  } finally {
+    if (savedUnsafe === undefined) delete process.env.FUNES_PG_UNSAFE;
+    else process.env.FUNES_PG_UNSAFE = savedUnsafe;
+  }
+});
+
 test("makeFaceDeps read: engages the PUBLISHED generation at --home; the leased stores are READ-ONLY", async () => {
   await withBackend("libsql", async () => {
     const vault = makeVault();
@@ -73,25 +99,35 @@ test("makeFaceDeps read: engages the PUBLISHED generation at --home; the leased 
   });
 });
 
-test("makeFaceDeps read: DIRECT mode when nothing is published, then ADOPTS a later publish (no restart)", async () => {
+// 0.3.0 item 15. This test used to assert DIRECT mode: a face at a home with nothing published
+// served the live index.db (generation null) and adopted the first publish later. It never worked —
+// `funes reindex` rebuilds index.db in place and the face's already-open SQLite handle does not
+// follow, so the face served boot-time bytes for its whole life while honestly reporting "no
+// generation". A served face serves published generations only; the finalized live index next door
+// is not a lesser mode, and is refused with the same message as an empty home.
+test("makeFaceDeps read: a home with nothing published REFUSES at startup, even with a finalized live index next to it", async () => {
   await withBackend("libsql", async () => {
     const vault = makeVault();
     const home = mkdtempSync(join(tmpdir(), "funes-facedeps-late-"));
-    // the static live index a face boots on before the sidecar's first publish
+    // the static live index a face used to boot on before the sidecar's first publish
     const staticDb = join(home, "index.db");
     const direct = await LibsqlStore.create(embedder, staticDb);
     await direct.remember([{ id: "wiki/static", path: "wiki/static.md", title: "Static", body: "static direct body", trust: "trusted" }]);
-    await direct.finalizeForPublish(); // an RO fallback open must not need WAL's -shm
+    await direct.finalizeForPublish(); // RO-openable, WAL retired — still not servable
     await direct.close();
 
+    // problem, fix, and the absence of an override — the sync-root guard's voice
+    await expect(makeFaceDeps(vault, { face: "read", home, embedder })).rejects.toThrow(/no published generation/);
+    await expect(makeFaceDeps(vault, { face: "read", home, embedder })).rejects.toThrow(new RegExp(`funes publish --home ${home}`));
+    await expect(makeFaceDeps(vault, { face: "read", home, embedder })).rejects.toThrow(/no fallback and no override/);
+    // and it names the live index it declined to serve, so a split-home operator sees both paths
+    await expect(makeFaceDeps(vault, { face: "read", home, embedder })).rejects.toThrow(new RegExp(staticDb));
+
+    // publish into that home and the identical call now serves the generation
+    const g = (await publishReindex({ vault, home, embedder, open })).generation;
     const deps = await makeFaceDeps(vault, { face: "read", home, embedder });
     await deps.withStore(async (ctx) => {
-      expect(ctx.generation).toBeNull(); // DIRECT fallback — loud in the startup log
-      expect((await ctx.store.recall({ query: "static direct body", k: 1 }))[0]!.id).toBe("wiki/static");
-    });
-    const g = (await publishReindex({ vault, home, embedder, open })).generation;
-    await deps.withStore(async (ctx) => {
-      expect(ctx.generation).toBe(g); // the sidecar's publish was adopted per-op
+      expect(ctx.generation).toBe(g);
       expect((await ctx.store.recall({ query: "sourdough loaf", k: 1 })).length).toBe(1);
     });
     await deps.close();
@@ -101,36 +137,45 @@ test("makeFaceDeps read: DIRECT mode when nothing is published, then ADOPTS a la
 test("makeFaceDeps read: an EMPTY home (no manifest, no index) fails STARTUP loudly, not per-request", async () => {
   await withBackend("libsql", async () => {
     const home = mkdtempSync(join(tmpdir(), "funes-facedeps-empty-"));
-    await expect(makeFaceDeps(makeVault(), { face: "read", home, embedder })).rejects.toThrow(/cannot open index read-only/);
+    // item 15: this used to fall through to a DIRECT open of a nonexistent index.db and surface the
+    // libsql error ("cannot open index read-only"). The refusal is now the publication one — same
+    // startup-not-per-request guarantee, a message that names the actual repair.
+    await expect(makeFaceDeps(makeVault(), { face: "read", home, embedder })).rejects.toThrow(/no published generation/);
   });
 });
 
-test("makeFaceDeps read R2-3: a legacy WAL DIRECT index refuses startup with the finalize repair", async () => {
+test("makeFaceDeps read R2-3: a legacy WAL live index refuses startup — now for being unpublished, not for being WAL", async () => {
   await withBackend("libsql", async () => {
     const vault = makeVault();
     const home = mkdtempSync(join(tmpdir(), "funes-facedeps-legacywal-"));
     const staticDb = join(home, "index.db");
     const direct = await LibsqlStore.create(embedder, staticDb);
     await direct.remember([{ id: "wiki/x", path: "wiki/x.md", title: "X", body: "legacy wal body", trust: "trusted" }]);
-    await direct.close(); // NO finalizeForPublish — the DIRECT index stays WAL-mode (unservable mode=ro)
-    await expect(makeFaceDeps(vault, { face: "read", home, embedder }))
-      .rejects.toThrow(/WAL-mode and cannot be served read-only|publish a finalized generation/);
+    await direct.close(); // NO finalizeForPublish — the live index stays WAL-mode (unservable mode=ro)
+    // The R2-3 SQLite-header sniff is gone: an unpublished home refuses whatever its journal mode,
+    // so the WAL-specific message bought nothing. The guarantee it existed for — never a cryptic
+    // per-request "cannot open index read-only" — is what this still pins.
+    const err = await makeFaceDeps(vault, { face: "read", home, embedder }).then(() => null, (e: Error) => e);
+    expect(err?.message).toMatch(/no published generation/);
+    expect(err?.message).not.toMatch(/cannot open index read-only/); // the refusal beat the libsql open
   });
 });
 
-test("makeFaceDeps F8: the legacy (vault, dbDir) call shape compiles + maps to broker (not read), pre-2026-07-16 semantics", async () => {
+test("makeFaceDeps F8: the legacy (vault, dbDir) call shape still maps to broker — and item 15 binds it too", async () => {
   await withBackend(undefined, async () => { // default backend = libsql
     const vault = makeVault();
-    const dbDir = join(mkdtempSync(join(tmpdir(), "funes-facedeps-legacy-")), "index.db");
-    // OLD 2-arg string form → face:'broker'. A READ face refuses non-libsql ("libsql-only"); the legacy
-    // shape must NOT — it opens a static store and serves, exactly the pre-unify behavior. (No
-    // embedder param on the old signature; a fresh empty index needs no embed to open + stat.)
-    const deps = await makeFaceDeps(vault, dbDir);
-    await deps.withStore(async (ctx) => {
-      expect(ctx.generation).toBeNull(); // fresh static index, nothing published/stamped
-      expect((await ctx.store.stats()).nodes).toBe(0); // opened + queryable
-    });
-    await deps.close();
+    const home = mkdtempSync(join(tmpdir(), "funes-facedeps-legacy-"));
+    const dbDir = join(home, "index.db");
+    // OLD 2-arg string form → face:'broker' at dirname(dbDir). It used to open that static path and
+    // serve a fresh empty index (generation null) — the pre-2026-07-16 semantics. Item 15 ends that:
+    // the string overload is a SERVED face like any other, so it needs a published generation in the
+    // home holding that path. The overload survives (the call shape still compiles and still means
+    // broker); what it no longer does is open a live index.
+    // "face broker:", not "face read:" — the overload still resolves to the broker principal.
+    // (No embedder param on the old signature, so this stops at the refusal rather than opening a
+    // published db the fake embedder built — an embedding-signature mismatch is a different test.)
+    // ...and it names dirname(dbDir) as the home it checked, the pre-existing home derivation
+    await expect(makeFaceDeps(vault, dbDir)).rejects.toThrow(new RegExp(`no published generation in ${home}`));
   });
 });
 
@@ -146,5 +191,38 @@ test("makeFaceDeps broker: stays READ-WRITE over the same published home (rememb
       expect(r.indexed).toBe(1); // the broker's write authority is intact
     });
     await deps.close();
+  });
+});
+
+test("makeFaceDeps: the deps carry the HOME (item 9's fence key) and a status refresher (RAI-144)", async () => {
+  await withBackend("libsql", async () => {
+    const vault = makeVault();
+    const home = mkdtempSync(join(tmpdir(), "funes-facedeps-status-"));
+    await publishReindex({ vault, home, embedder, open });
+    const id = readGenerationManifest(home)!.publicationId!;
+    const deps = await makeFaceDeps(vault, { face: "broker", home, embedder });
+    try {
+      // item 9: the broker's mutation fence is keyed on THIS, and it has to be the same home the
+      // publisher writes — a fence on the wrong dir serializes nothing while looking like it does.
+      expect(deps.home).toBe(home);
+
+      // The eager first open already acked, via onServe.
+      const statusFile = join(home, ".status", "broker.json");
+      const acked = JSON.parse(readFileSync(statusFile, "utf8")) as { publicationId: string; contentGeneration: string; protocolVersion: string; at: number };
+      expect(acked.publicationId).toBe(id);
+      expect(acked.protocolVersion).toBe(INDEX_SCHEMA_VERSION);
+
+      // RAI-144 / item 8: a mutation invalidates the content generation in the very database this
+      // principal is serving, so the refresher the face calls after every write must re-stamp BOTH
+      // halves — the id unchanged (immutable), the content generation now null.
+      await deps.withStore((ctx) => ctx.store.remember([{ id: "out_memory/m2", title: "M2", body: "a broker write" }]));
+      await deps.refreshStatus!();
+      const after = JSON.parse(readFileSync(statusFile, "utf8")) as { publicationId: string; contentGeneration: string | null; at: number };
+      expect(after.publicationId).toBe(id);
+      expect(after.contentGeneration).toBeNull();
+      expect(after.at).toBeGreaterThanOrEqual(acked.at);
+    } finally {
+      await deps.close(); // also stops the heartbeat — a face that exits stops acking
+    }
   });
 });

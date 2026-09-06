@@ -1,6 +1,6 @@
 {
   "name": "funes-libsql",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "type": "module",
   "private": true,
   "description": "funes Store backend on libSQL (native vector + FTS5) \u2014 swappable alternative to funes-engine (FUNES_BACKEND=libsql)",

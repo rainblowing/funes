@@ -11,7 +11,7 @@ import frozen from "./__fixtures__/ops-contract.json" with { type: "json" };
 // Regenerating this fixture IS a contract change. Do it in its own commit whose diff is the
 // release note — never in the same commit as the schema edit that caused it.
 
-test("advertised inputSchema matches the frozen contract, op by op (all 13, incl. internal)", () => {
+test("advertised inputSchema matches the frozen contract, op by op (all 15, incl. internal)", () => {
   const live = operations.map((o) => ({ name: o.name, internal: o.internal ?? false, inputSchema: o.inputSchema }));
   expect(live).toEqual(frozen.operations as typeof live);
 });
@@ -26,6 +26,7 @@ test("the guarded twins advertise the same schema as the ops they stand in for",
   const by = (n: string) => operations.find((o) => o.name === n)!.inputSchema;
   expect(by("guarded_recall")).toEqual(by("recall"));
   expect(by("guarded_indexed_page")).toEqual(by("indexed_page"));
+  expect(by("guarded_health")).toEqual(by("health"));
 });
 
 // ── the total-schema contract: garbage clamps or defaults, it never 400s ────────────────────
@@ -37,7 +38,10 @@ const ctx = {} as OperationContext; // parse fails before `run` is reached in ev
 async function argsOf(name: string, args: Record<string, unknown>): Promise<unknown> {
   // Reach the parsed args without a store: swap in a run() that echoes them.
   const real = operations.find((o) => o.name === name)!;
-  const spy = { ...real, run: async (_c: OperationContext, a: unknown) => a };
+  // 0.3.0 item 16: dispatch now wraps a `scopeGuarded` op in the store's guarded read, and these
+  // cases carry no store — they are about the ARGUMENT gate, which runs before the guard and is
+  // what the spy replaces `run` to observe. Clearing the flag keeps that the only thing measured.
+  const spy = { ...real, scopeGuarded: false, run: async (_c: OperationContext, a: unknown) => a };
   return dispatchToolCall([spy], name, args, ctx);
 }
 
@@ -108,7 +112,9 @@ test("indexed_page's id-OR-path rule is truthiness, and invisible in the adverti
   expect(schema.required).toBeUndefined();
 });
 
-test("buildToolDefs still advertises 11 of 13 (guarded_* stay internal)", () => {
-  expect(buildToolDefs(operations)).toHaveLength(11);
-  expect(operations).toHaveLength(13);
+test("buildToolDefs still advertises 12 of 15 (guarded_* stay internal)", () => {
+  // 12/15 since 0.3.0 item 19 added `recall_v2` beside `recall`; the three guarded_* twins stay
+  // internal, which is the ratio this case exists to pin.
+  expect(buildToolDefs(operations)).toHaveLength(12);
+  expect(operations).toHaveLength(15);
 });

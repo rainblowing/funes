@@ -93,9 +93,10 @@ export interface Embedder {
 /** Stable model identity for the embedding signature (H1 drift guard). All optional on the
  *  interface so test fakes need not set them; the pinned production embedder (E5) returns its full
  *  identity. The extended fields (Codex R3#4) make DISTINCT weights/quantization/pooling/truncation
- *  yield DISTINCT signatures — so two loci (Mac + NAS) can never publish "the same" generation from
- *  materially different embedders (a q8-vs-fp32 or upstream-reupload divergence the bare `<id>:<dim>`
- *  missed). A pinned immutable `revision` is the actual guarantee; the rest disambiguate config. */
+ *  yield DISTINCT signatures — so two loci (Mac + NAS) can never publish "the same" CONTENT
+ *  GENERATION from materially different embedders (a q8-vs-fp32 or upstream-reupload divergence the
+ *  bare `<id>:<dim>` missed). A pinned immutable `revision` is the actual guarantee; the rest
+ *  disambiguate config. */
 export interface EmbedderId {
   readonly id?: string;
   /** Immutable model revision (e.g. an HF commit sha) the impl pins its download to. */
@@ -111,6 +112,10 @@ export interface EmbedderId {
 /** The embedding signature pinned into an index (H1, GBrain). Base `<model-id>:<dim>`; a real
  *  embedder appends its pinned identity (`rev=…:dt=…:pool=…:trunc=…`) in fixed order. A change is a
  *  hard stop on open — a same-dim model/weight/config swap would silently mis-recall otherwise.
+ *
+ *  NOT one of the three signatures (PLAN-0.3.0 P1): this names the EMBEDDER, and it enters the
+ *  content generation as the `embeddingSpec` tail input. The embedding-content FINGERPRINT — the
+ *  only trigger for a re-embed — is `hashItem()` in funes-shared/src/generation.ts.
  *  Backward-compatible: an embedder exposing only {id,dim} keeps its historical signature, so the
  *  golden fixtures' fakes are unaffected; only richer embedders (E5) get the extended tail. */
 export function embeddingSignature(e: Embedder): string {
@@ -150,11 +155,18 @@ export interface Store {
   /** Prune the index to only `keepIds` — full-reindex GC so deleted/tombstoned files leave the
    *  index (H2/D7). Returns the number of stale rows removed. */
   prune(keepIds: string[]): Promise<number>;
-  /** H2 dirty-marker epoch (optional): set at the start of a FULL rebuild, cleared only after
-   *  its prune commits. An interrupted run leaves the marker; the store refuses normal opens
-   *  until a full reindex completes — no partial live index is silently served. */
+  /** H2 dirty-marker epoch (optional): set at the start of a FULL rebuild, cleared only by the
+   *  `finalizeReindex` that commits after its prune. An interrupted run leaves the marker; the
+   *  store refuses normal opens until a full reindex completes — no partial live index is
+   *  silently served. A store that implements this MUST implement `finalizeReindex`: nothing
+   *  else clears the marker. */
   beginReindex?(): Promise<void>;
-  endReindex?(): Promise<void>;
+  /** PLAN-0.3.0 item 12 — the ONE end of a full reindex, committed as ONE backend transaction.
+   *  It replaced `endReindex()` + `setGeneration()`: clearing the stamp was already atomic while
+   *  SETTING it was four independent statements in four implicit transactions, so a crash between
+   *  them left a stamp over rows it did not name, or a cleared dirty marker over an unstamped
+   *  index. There is no "close the window without stamping" verb any more, on purpose. */
+  finalizeReindex?(f: FinalizeReindex): Promise<void>;
   /** Persist the index_scope signature (closure sprint 3B). Called by a FULL reindex ONLY, so the
    *  hash advances exactly with the authoritative prune. */
   setScopeSignature?(sig: ScopeSignature): Promise<void>;
@@ -165,14 +177,20 @@ export interface Store {
   clearScopeSignature?(): Promise<void>;
   /** The persisted index_scope signature, or null when the index has never stamped one. */
   getScopeSignature?(): Promise<ScopeSignature | null>;
-  /** generation-v1 (canon re-homing R5#1): persist the content-generation hash stamped by a FULL
-   *  index build — sha256 over the canonical "v1" encoding of (path, content-hash, trust) records
-   *  ‖ index scope ‖ parser version ‖ embedding spec ‖ index schema version (see funes-engine/src/
-   *  generation.ts, the ONE encoding module). Deterministic across loci: two builds of identical
-   *  content in different dirs stamp the SAME value, so canon/follower divergence is observable. */
-  setGeneration?(generation: string): Promise<void>;
-  /** The persisted generation, or null when the index predates generation stamping. */
-  getGeneration?(): Promise<string | null>;
+}
+
+/** What `finalizeReindex` commits, in one transaction (PLAN-0.3.0 item 12). */
+export interface FinalizeReindex {
+  /** The content generation the completed FULL build establishes — the canonical identity of the
+   *  rows the index now holds (funes-shared/generation.ts, the ONE encoding module). Deterministic
+   *  across loci: two builds of identical content in different dirs stamp the SAME value, so
+   *  canon/follower divergence is observable. */
+  contentGeneration: string;
+  /** The built scope this run establishes: a signature STAMPS it, `null` CLEARS it (an absent/
+   *  invalid-manifest configless rebuild must not re-bless re-admitted files), `undefined` leaves
+   *  the prior one alone. Same tri-state the separate set/clearScopeSignature calls had — moved in
+   *  here because the built scope describes the rows this transaction is naming. */
+  scope?: ScopeSignature | null;
 }
 
 /** Lifecycle + provenance frontmatter for agent-written memory (`out_memory/<id>.md`).

@@ -5,8 +5,24 @@
 # matrix job would produce N different tarballs and publish an artifact nothing tested; `npm publish`
 # from source would re-run the build and ship bytes no job ever ran.
 #
-# Runs on every push (build + smoke, no publish) so the gate cannot rot between releases, and
-# publishes only on a v* tag.
+# Runs on every push (build + smoke, no publish) so the gate cannot rot between releases.
+#
+# PUBLISHING IS A SEPARATE ACT FROM TAGGING (2026-08-30). It used to be the same one: any pushed v*
+# tag published to npm, and the dist-tag is derived from the version, so a plain `0.2.1` would have
+# gone out as `latest`. That made "mark this commit as the release" and "ship it to every user of
+# `npm i -g`" one keystroke — and 0.2.1's own plan says, twice, to tag WITHOUT publishing. There was
+# no way to express that, so the tag could not be pushed at all.
+#
+# Now a tag push builds and smokes and stops. To publish, DISPATCH this workflow against the tag ref
+# with `publish: true`:
+#
+#   gh workflow run release.yml --ref v0.2.1 -f publish=true
+#
+# Both conditions are load-bearing. The ref must be a v* tag, because the publish step verifies the
+# packaged version against it and refuses a mismatch. The input must be ticked, because a dispatch
+# against a tag is otherwise a perfectly reasonable way to re-run a gate. This is deliberately not a
+# repository variable: a persistent flag is a hatch that stays open, and the whole point is that
+# each publish is decided once, on the day it happens.
 name: release
 
 on:
@@ -15,20 +31,27 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the tested tarball to npm. Only takes effect when dispatched against a v* TAG ref."
+        type: boolean
+        default: false
 
 # A release pushes main and its tag ATOMICALLY (scripts/export-public.ts), and GitHub answers one
 # such push with TWO workflow runs — one per ref. Both build and both run the full smoke matrix,
 # which means eight cold model downloads from one runner IP at once: the exact condition that got
 # HTTP 429'd by Hugging Face and read as flakiness. Serialize instead. cancel-in-progress is FALSE
-# on purpose — cancelling would race to kill the tag run, which is the only one that publishes.
+# on purpose — cancelling would race to kill a run that may be the publishing dispatch, and a
+# half-killed publish is worse than a slow queue.
 concurrency:
   group: release
   cancel-in-progress: false
 
-# The bundler result is version-specific: bun 1.3.14 is what the shebang and single-file behaviour
-# were verified against. `latest` would silently change the artifact.
+# The bundler result is version-specific: the pinned BUN_VERSION (1.4.0 since 2026-08-24; 1.3.14
+# before) is what the shebang and single-file behaviour were verified against — the shebang
+# assertion below re-verifies it on every run. `latest` would silently change the artifact.
 env:
-  BUN_VERSION: "1.3.14"
+  BUN_VERSION: "1.4.0"
 
 jobs:
   pack:
@@ -70,11 +93,21 @@ jobs:
           set -euo pipefail
           list=$(tar -tzf "$TARBALL")
           echo "$list"
-          for want in package/package.json package/dist/cli.js package/README.md package/LICENSE; do
-            echo "$list" | grep -qx "$want" || { echo "MISSING from tarball: $want"; exit 1; }
+          # HERESTRINGS, never `echo "$x" | grep -q`. `grep -q` exits the instant it matches and
+          # closes the pipe; `echo` then dies of EPIPE, and `set -o pipefail` reports THAT as the
+          # pipeline's status. Whether echo finishes first is a race, and it fails both ways:
+          # `... || { exit 1; }` reports a present file as MISSING (seen on 2026-08-30), and the two
+          # `! ... ||` leak checks report a REAL leak as clean, because the inverted non-zero reads
+          # as success. A herestring has no pipeline, so there is nothing to race.
+          # npm-shrinkwrap.json is asserted here because its omission is SILENT: npm does not
+          # force-include it when `files` is set, so `npm pack` drops it with no warning and exit 0,
+          # and the tarball then looks locked while resolving ranges freely. build-cli.ts's `files`
+          # array is the only thing putting it in; this is the gate behind that one array literal.
+          for want in package/package.json package/dist/cli.js package/README.md package/LICENSE package/npm-shrinkwrap.json; do
+            grep -qx "$want" <<<"$list" || { echo "MISSING from tarball: $want"; exit 1; }
           done
-          ! echo "$list" | grep -q "\.test\.ts$" || { echo "test files leaked into the tarball"; exit 1; }
-          ! echo "$list" | grep -q "__fixtures__" || { echo "fixtures leaked into the tarball"; exit 1; }
+          ! grep -q "\.test\.ts$" <<<"$list" || { echo "test files leaked into the tarball"; exit 1; }
+          ! grep -q "__fixtures__" <<<"$list" || { echo "fixtures leaked into the tarball"; exit 1; }
 
       - name: hash
         id: hash
@@ -138,30 +171,34 @@ jobs:
           npm install "$GITHUB_WORKSPACE/$TARBALL" --no-audit --no-fund --foreground-scripts
 
       # bun is deliberately NOT installed on this job. The built shebang says `#!/usr/bin/env node`,
-      # and bun 1.3.14 does NOT rewrite it for --target=node — so without this, `node dist/cli.js`
-      # would pass while the command a user actually types dies on a machine without bun.
+      # and bun at the pinned BUN_VERSION does NOT rewrite it for --target=node — so without this,
+      # `node dist/cli.js` would pass while the command a user actually types dies on a machine
+      # without bun.
       - name: smoke the installed command
         shell: bash
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/clean"
           BIN=node_modules/.bin/funes
-          head -1 node_modules/@funes-tech/cli/dist/cli.js | grep -qx '#!/usr/bin/env node'
+          grep -qx '#!/usr/bin/env node' <<<"$(head -1 node_modules/@funes-tech/cli/dist/cli.js)"
           command -v bun && { echo "bun is on PATH — this job must prove the artifact runs without it"; exit 1; } || true
 
           v=$("$BIN" --version)
           manifest=$(node -p "require('./node_modules/@funes-tech/cli/package.json').version")
           [ "$v" = "$manifest" ] || { echo "version drift: bin says $v, manifest says $manifest"; exit 1; }
 
-          # These exit non-zero BY DESIGN (usage=2, refusal=1). Capture first: piping them into grep
-          # under `set -o pipefail` fails the step on the LEFT side's status even when grep matches.
+          # These exit non-zero BY DESIGN (usage=2, refusal=1), so capture first — piping them into
+          # grep under `set -o pipefail` fails the step on the LEFT side's status even when grep
+          # matches. Then feed grep by HERESTRING rather than `echo |`, for the EPIPE race above:
+          # `echo "$usage" | grep -q "publish" && { exit 1; }` would let a real hit pass silently
+          # whenever grep won, which is the assertion keeping `publish` out of the shipped bin.
           usage=$("$BIN" 2>&1 || true)
-          echo "$usage" | grep -q "usage: funes"
-          echo "$usage" | grep -q "publish" && { echo "publish must not be in the published bin"; exit 1; }
+          grep -q "usage: funes" <<<"$usage"
+          grep -q "publish" <<<"$usage" && { echo "publish must not be in the published bin"; exit 1; }
 
           refusal=$(FUNES_BACKEND=postgres "$BIN" query x --vault . 2>&1 || true)
-          echo "$refusal" | grep -q "not available in this build"
-          echo "$refusal" | grep -qi "at makeStore\|node_modules" && { echo "refusal leaked a stack trace"; exit 1; }
+          grep -q "not available in this build" <<<"$refusal"
+          grep -qi "at makeStore\|node_modules" <<<"$refusal" && { echo "refusal leaked a stack trace"; exit 1; }
           true
 
       # No model cache is restored anywhere in this workflow ON PURPOSE: a GitHub runner is
@@ -187,7 +224,7 @@ jobs:
             echo "reindex attempt $attempt failed — retrying in $((attempt * 20))s"
             sleep $((attempt * 20))
           done
-          "$BIN" query "protein creatine" --vault . | grep -q fitness.md
+          grep -q fitness.md <<<"$("$BIN" query "protein creatine" --vault .)"
           echo "a memory over a pipe" | "$BIN" remember --vault . --title "piped"
           "$BIN" grandfather --vault .
 
@@ -205,7 +242,10 @@ jobs:
   publish:
     name: publish the tested tarball
     needs: [pack, smoke]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Two conditions, not one. `inputs` is empty on a push, so `inputs.publish` is null and a tag
+    # push builds, smokes, and stops — which is what makes tagging a release possible without
+    # shipping it. See the header for the dispatch that does publish.
+    if: startsWith(github.ref, 'refs/tags/v') && inputs.publish
     runs-on: ubuntu-latest
     environment: npm
     permissions:

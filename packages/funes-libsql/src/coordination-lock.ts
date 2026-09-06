@@ -220,6 +220,15 @@ export async function withCoordinationLock<T>(dir: string, fn: () => Promise<T>,
     0,
     Math.floor(opts?.timeoutMs ?? Number(process.env.FUNES_COORDINATION_TIMEOUT_MS ?? DEFAULT_COORDINATION_TIMEOUT_MS)),
   );
+  // Create the dir BEFORE deriving the key. `cacheKey` realpaths and falls back to the raw path when
+  // the dir does not exist yet — so on a Mac, where /var is a symlink to /private/var, the FIRST
+  // caller keyed its in-process mutex on `/var/…` (dir absent) and every later caller on
+  // `/private/var/…` (dir now present, created by that first caller). Two different mutex keys, so
+  // the FIFO gate did not serialize them at all; they then met inside acquireCoordinationLock, whose
+  // own key IS the realpath (it mkdirs first), found depth > 0, and each entered as a "reentrant
+  // frame" — the exact overlap this module's async-owner design exists to prevent. Found by the
+  // PLAN-0.3.0 item 9 fence test, where a held fence failed to hold a publisher out.
+  mkdirSync(dir, { recursive: true });
   const key = cacheKey(dir);
   const owned = ownedKeys.getStore();
   if (owned?.has(key)) return fn(); // reentrant within THIS async owner — the frame already holds it

@@ -17,18 +17,23 @@ import { join, normalize, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { RecallResult } from "funes-core";
 import { parseFrontmatter } from "./markdown.ts";
-import { crossStarExpectedHash } from "./scope.ts";
+import { vaultChangedSince } from "./reindex.ts";
+import { crossStarExpectation, ownStarExpectation } from "./scope.ts";
 import { zoneOfDir } from "funes-shared";
+import { authorizeCanonicalWrite, reportWriteDecision, resolveWriteDesignation, type WriteDesignation } from "./write-designation.ts";
 import type { FunesIndexStore } from "./store.ts";
 import type { FunesStore } from "./funes-store.ts";
+import { operatorState } from "./machine-state.ts";
 
-export interface OperationContext {
+/** The context a READ op needs, and no more (PLAN-0.2.1 step 15). It is the WHOLE context minus
+ *  the write-through surface, which is what makes the hub's seam checkable by the compiler rather
+ *  than by review: the hub builds one of these, and a mutating op — whose `run` demands `funes` —
+ *  is simply not assignable to the read registry it dispatches through. */
+export interface ReadOperationContext {
   remote: boolean;
   trust: "trusted" | "untrusted";
   vault: string;
   store: FunesIndexStore;
-  /** The D7 write-through surface — mutations ONLY go through it (assertOwned + sanitize). */
-  funes: FunesStore;
   /** Move 5: when the daemon was started with `--rerank`, every recall runs the cross-encoder
    *  final stage (mirroring the CLI `--rerank` semantics). Default false — the daemon stays
    *  light. A no-op unless the store was also constructed with a Reranker. NOT a per-request
@@ -36,15 +41,41 @@ export interface OperationContext {
   rerank?: boolean;
 }
 
+export interface OperationContext extends ReadOperationContext {
+  /** The D7 write-through surface — mutations ONLY go through it (assertOwned + sanitize). */
+  funes: FunesStore;
+  /** 0.3.0 item 24: who is performing this mutation, from TRUSTED process configuration or from a
+   *  capability-to-actor mapping (actor.ts) — never from the payload. Absent ⇒ `unknown`; it is
+   *  reported in the designation audit, and the STAMPED `write_actor` comes from the store's
+   *  constructor, which is the seam that was already right. */
+  actor?: string;
+  /** 0.3.0 item 25: the writer designation this serving context was configured with. Absent ⇒
+   *  resolved from the vault's star.yaml plus the environment at dispatch, so a surface that has
+   *  not been taught to pass one is still audited rather than silently exempt. */
+  designation?: WriteDesignation;
+}
+
 /** The MCP `inputSchema` wire shape — the JSON Schema subset `z.toJSONSchema(…, {io:"input"})`
  *  emits for our object schemas. Deliberately loose per property: a schema that grows a `default`
  *  or a `maximum` must be representable here without a type change, because THIS is what
  *  `buildToolDefs` ships to clients verbatim. */
-export interface OpInputSchema {
+// A TYPE ALIAS, not an interface, and that is load-bearing: TS gives an object type alias an
+// implicit index signature, an interface never gets one. The MCP SDK types `tools/list`'s schema
+// with `[x: string]: unknown`, so as an interface this refused to assign and every server boundary
+// needed a cast.
+export type OpInputSchema = {
   type: "object";
-  properties: Record<string, Record<string, unknown>>;
+  properties: Record<string, JsonSchemaKeywords>;
   required?: string[];
-}
+};
+
+/** One property's JSON Schema keywords. Values are JSON, spelled out rather than left as `unknown`:
+ *  the MCP SDK types `tools/list` with a recursive JSON union, and `unknown` is not assignable to
+ *  it, so `unknown` here forced a cast at every server boundary. Still deliberately loose about
+ *  WHICH keywords appear — a schema that grows a `default` or a `maximum` must be representable
+ *  without a type change, because this is what `buildToolDefs` ships to clients verbatim. */
+export type JsonSchemaKeywords = Record<string, JsonValue>;
+export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
 export interface Operation {
   name: string;
@@ -61,6 +92,20 @@ export interface Operation {
    *  A `--cross-star` surface admits `index`-served ops ONLY — an fs-served op on a cross-star
    *  boundary would leak files the index deliberately excludes. */
   served: "index" | "fs";
+  /** PLAN-0.3.0 item 16: does the OWN-STAR index_scope guard wrap this op's dispatch?
+   *
+   *  True for every op that answers out of the index's ROWS — those are the rows `index_scope`
+   *  withdrew, and until this release the guard ran ONLY in `--cross-star` mode, so every ordinary
+   *  MCP client and HTTP face served a narrowed-then-not-reindexed vault's excluded pages happily.
+   *
+   *  Declared per op rather than derived from `served`, because `served` answers a different
+   *  question (does this op touch the filesystem, and may a cross-star surface expose it) and two
+   *  ops — `neighbors` and `graph` — read the store while being marked `"fs"` precisely to keep
+   *  them OFF the cross-star surface. Deriving would have left both leaking.
+   *
+   *  `page`/`tree` are absent on purpose: they read the vault directly and bypass `index_scope` by
+   *  design; item 22's loopback rule is their boundary, not this one. */
+  scopeGuarded?: boolean;
   /** H9: an INTERNAL op the client never names directly — the mcp.ts cross-star translation maps
    *  recall/indexed_page to the guarded_* variants and the daemon proxy dispatches them. Internal
    *  ops are hidden from tool listings (buildToolDefs) and un-allowlistable (resolveExposedOps), yet
@@ -72,6 +117,13 @@ export interface Operation {
   run(ctx: OperationContext, args: unknown): Promise<unknown>;
 }
 
+/** An operation that runs on a READ context. Assignable to `Operation` — a function accepting the
+ *  WIDER `ReadOperationContext` accepts an `OperationContext` too — so these still live in the one
+ *  registry, while the hub can hold them in a list a write op cannot enter. */
+export interface ReadOperation extends Omit<Operation, "run"> {
+  run(ctx: ReadOperationContext, args: unknown): Promise<unknown>;
+}
+
 /** Define one operation: derives `inputSchema` from `args` and types `run`'s args as `z.output`.
  *  The `$schema` key zod emits is stripped — it was never part of the advertised contract. */
 function op<A extends z.ZodType>(def: {
@@ -80,11 +132,27 @@ function op<A extends z.ZodType>(def: {
   args: A;
   readonly: boolean;
   served: "index" | "fs";
+  scopeGuarded?: boolean;
   internal?: boolean;
   run(ctx: OperationContext, args: z.output<A>): Promise<unknown>;
 }): Operation {
   const { $schema: _drop, ...json } = z.toJSONSchema(def.args, { io: "input" }) as Record<string, unknown>;
   return { ...def, inputSchema: json as unknown as OpInputSchema, run: def.run as Operation["run"] };
+}
+
+/** `op()` for an op that needs no write surface. Same derivation; the only difference is the
+ *  context its `run` accepts, and that difference is the whole point — see `ReadOperation`. */
+function readOp<A extends z.ZodType>(def: {
+  name: string;
+  description: string;
+  args: A;
+  readonly: true;
+  served: "index";
+  internal?: boolean;
+  run(ctx: ReadOperationContext, args: z.output<A>): Promise<unknown>;
+}): ReadOperation {
+  const { $schema: _drop, ...json } = z.toJSONSchema(def.args, { io: "input" }) as Record<string, unknown>;
+  return { ...def, inputSchema: json as unknown as OpInputSchema, run: def.run as ReadOperation["run"] };
 }
 
 /** A bounded count argument. TOTAL by construction, and deliberately so:
@@ -118,8 +186,21 @@ const optionalText = (description: string) =>
   z.string().describe(description).optional().transform((v) => v || undefined);
 
 /** H9: the recall op's public projection (shared by `recall` and the guarded `guarded_recall`, so
- *  the cross-star path returns a byte-identical shape). Emits the raw RRF score (parity contract). */
-function shapeRecall(res: RecallResult[]): Array<Record<string, unknown>> {
+ *  the cross-star path returns a byte-identical shape). Emits the raw RRF score (parity contract).
+ *  Sharing the function is NOT enough to keep that promise — `guarded_recall` shipped calling it
+ *  with one argument, so `vaultChangedSinceReindex` was absent on exactly the path that cannot ask
+ *  for it any other way, while this comment claimed otherwise. BOTH callers pass `stale`. */
+/** PLAN-0.3.0 item 18: THE freshness call, with BOTH arguments. `vaultChangedSince` has taken an
+ *  `indexedIds` thunk — the only way it can see a DELETION, since a note that is gone leaves no file
+ *  behind to be newer — and all five call sites passed two arguments, so the thunk was `undefined`,
+ *  `?? []` made the id set empty, and no deletion has ever been detected. The receiving logic was
+ *  written and tested; it had simply never been given its argument. Funnelling every caller through
+ *  one helper is what stops the sixth call site from omitting it again. */
+function freshness(ctx: ReadOperationContext, stampedAt: () => Promise<string | null>): Promise<boolean | null> {
+  return vaultChangedSince(ctx.vault, stampedAt, () => ctx.store.indexedIds());
+}
+
+function shapeRecall(res: RecallResult[], stale: boolean | null = null): Array<Record<string, unknown>> {
   // `volatile`/`freshness` were indexed and tiebroken on from P5.19 but never emitted, so no agent
   // could see which hits were state (replaceable) versus event (append-only) — which is precisely
   // why supersede() was unusable in practice: the caller must already know oldId, and nothing here
@@ -136,6 +217,12 @@ function shapeRecall(res: RecallResult[]): Array<Record<string, unknown>> {
     ...(r.volatile ? { volatile: true } : {}),
     ...(r.freshness ? { freshness: r.freshness } : {}),
     ...(r.duplicates ? { duplicates: r.duplicates } : {}),
+    // `health` carries the same flag, but health is a call an agent never makes on its way to an
+    // answer — so a model had no way to know the hit it is about to cite came from an index older
+    // than the notes. Stamped ONLY when true: the key is additive and absent on a current index, so
+    // the array shape every consumer already parses is unchanged. The tri-state (false vs unknown)
+    // stays on health; here, absence means "not flagged".
+    ...(stale ? { vaultChangedSinceReindex: true } : {}),
   }));
 }
 
@@ -192,6 +279,98 @@ const strList = (v: string | undefined): string[] | undefined =>
   v ? v.split(",").map((x) => x.trim()).filter(Boolean) : undefined;
 
 // ── the operations ───────────────────────────────────────────────────────────────────────
+// ── H9 guarded cross-star reads (INTERNAL) — the daemon-side/atomic half of the --cross-star
+//    surface, and (PLAN-0.2.1 step 15) the WHOLE surface the hub may dispatch. The client always
+//    names `recall`/`indexed_page`; mcp.ts translates those to the guarded_* ops in --cross-star
+//    mode (direct AND over the daemon proxy), so the scope check + the retrieval happen in ONE
+//    atomic guarded store read server-side. Each resolves the CURRENT policy from ctx.vault's
+//    star.yaml itself (never a client-supplied hash), refusing when the manifest is absent/invalid
+//    (H2) or the persisted signature is missing/ignored/stale/mid-reindex.
+//
+//    They are hoisted OUT of the registry array and spread back into it so this list can be its
+//    own exported value. That is what makes step 15's "read operations only" a type, not a habit:
+//    every member is a `ReadOperation`, a mutating op's `run` demands the write surface, and the
+//    two are not assignable — adding `remember` here is a compile error, not a review catch.
+export const HUB_READ_OPS: ReadOperation[] = [
+  readOp({
+    name: "guarded_recall",
+    description: "Cross-star GUARDED recall (internal): atomically verifies the index_scope boundary and returns recall results in the same guarded read, or refuses. The daemon-side half of --ops --cross-star.",
+    args: z.object({
+      query: z.string().describe("free-text question"),
+      k: count("max results (default 5)", 5, 50),
+    }),
+    readonly: true,
+    served: "index",
+    internal: true,
+    async run(ctx, args) {
+      const res = await ctx.store.guardedRead(crossStarExpectation(ctx.vault), () =>
+        ctx.store.recall({ query: args.query, k: args.k, rerank: ctx.rerank === true }));
+      if ("refusal" in res) throw new Error(res.refusal);
+      // The staleness flag belongs HERE most of all: a cross-star caller cannot run `health` against
+      // someone else's star, so this key is the only way it learns the rows it is about to cite came
+      // from an index older than the notes. Safe on this boundary — the walk is index_scope-scoped
+      // (reindex.ts indexedFileExclude), so it does not bypass what `served: "index"` protects, and
+      // it returns no file content: one boolean over mtimes of the very corpus this caller may
+      // already recall in full. Ordered AFTER the guarded read, which is load-bearing:
+      // crossStarExpectation has by then refused an absent/invalid manifest, so the scope lookup
+      // cannot take its configless FALLBACK branch — the one place it would walk unscoped.
+      return shapeRecall(res.ok, await freshness(ctx, async () => (await ctx.store.stats()).lastReindexAt));
+    },
+  }),
+  readOp({
+    name: "guarded_indexed_page",
+    description: "Cross-star GUARDED indexed_page (internal): atomic index_scope check + indexed-snapshot read in one guarded read, or refusal. The daemon-side half of --ops --cross-star.",
+    args: indexedPageArgs(),
+    readonly: true,
+    served: "index",
+    internal: true,
+    async run(ctx, args) {
+      const res = await ctx.store.guardedRead(crossStarExpectation(ctx.vault), () => ctx.store.indexedPage({ id: args.id, path: args.path }));
+      if ("refusal" in res) throw new Error(res.refusal);
+      if (!res.ok) throw new Error(`indexed_page: "${args.id ?? args.path}" is not in the index (unindexed, index_scope-excluded, or not found)`);
+      return res.ok;
+    },
+  }),
+  readOp({
+    name: "guarded_health",
+    description: "Cross-star GUARDED health (internal): the same index stats as `health`, behind the atomic index_scope check, with the absolute vault path projected out. The hub's per-star health call.",
+    args: z.object({}),
+    readonly: true,
+    served: "index",
+    internal: true,
+    async run(ctx) {
+      // The scope guard is not decoration here. `health` is exempt because a same-star caller
+      // already knows its own vault; a HUB caller does not, and stats over a mid-reindex or
+      // scope-drifted index would describe a corpus the caller may not read.
+      const res = await ctx.store.guardedRead(crossStarExpectation(ctx.vault), () => ctx.store.stats());
+      if ("refusal" in res) throw new Error(res.refusal);
+      const stats = res.ok;
+      const vaultChangedSinceReindex = await freshness(ctx, async () => stats.lastReindexAt);
+      // `vault` is DELIBERATELY absent: `health` returns the absolute path, and a hub answer must
+      // not hand one star's filesystem layout to a caller reaching in from another. The catalogue
+      // already names the star; the path is the operator's, not the caller's.
+      return { ...stats, vaultChangedSinceReindex };
+    },
+  }),
+];
+
+/** The names the hub may dispatch, as a TYPE. A caller that asks for anything else — a write op, a
+ *  filesystem-served op, a typo — does not compile. */
+export type HubOpName = "guarded_recall" | "guarded_indexed_page" | "guarded_health";
+
+/** Dispatch one hub read op: the same required-presence + schema path as `dispatchToolCall`, over
+ *  the read registry and a context that HAS no write surface to reach. */
+export async function dispatchReadOp(
+  name: HubOpName,
+  args: Record<string, unknown>,
+  ctx: ReadOperationContext,
+): Promise<unknown> {
+  const op = HUB_READ_OPS.find((o) => o.name === name);
+  if (!op) throw new Error(`unknown read operation: ${name}`); // unreachable via the type; kept for JS callers
+  const parsed = parseOpArgs(op, name, args);
+  return op.run(ctx, parsed);
+}
+
 export const operations: Operation[] = createRegistry([
   op({
     name: "recall",
@@ -205,12 +384,50 @@ export const operations: Operation[] = createRegistry([
     }),
     readonly: true,
     served: "index", // recall reads the derived store — index_scope IS the boundary
+    scopeGuarded: true, // item 16: the rows recall returns ARE the rows index_scope withdraws
     async run(ctx, args) {
       // Move 5: rerank is a daemon-wide posture (ctx.rerank, set from `--rerank` at startup),
       // never a client argument — so the input schema exposes no `rerank` key. It is a no-op
       // unless the store also carries a Reranker (mirrors the CLI: --rerank => reranker + flag).
       const res = await ctx.store.recall({ query: args.query, k: args.k, rerank: ctx.rerank === true });
-      return shapeRecall(res);
+      return shapeRecall(res, await freshness(ctx, async () => (await ctx.store.stats()).lastReindexAt));
+    },
+  }),
+  op({
+    name: "recall_v2",
+    description:
+      "Hybrid recall (as `recall`) returning a VERSIONED ENVELOPE: { publicationId, contentGeneration, " +
+      "generationValid, servingSignature, results }. `results` is byte-identical to what `recall` returns; " +
+      "the envelope names WHICH rows answered and WHAT semantics answered over them, so a consumer can " +
+      "tell two honestly-different answers apart instead of reading the difference as a bug.",
+    args: z.object({
+      query: z.string().describe("free-text question"),
+      k: count("max results (default 5)", 5, 50),
+    }),
+    readonly: true,
+    served: "index",
+    scopeGuarded: true,
+    async run(ctx, args) {
+      // PLAN-0.3.0 item 19. `recall` is NOT replaced and NOT deprecated in this release: retiring it
+      // needs a twinkl.ing release, which the plan names as an EXTERNAL release gate — so the two
+      // ops ship side by side and share the projection below, exactly as `guarded_recall` does. The
+      // shape promise is that `results` is the same array `recall` returns, so a consumer migrates
+      // by reading one key deeper, not by reparsing hits.
+      const stats = await ctx.store.stats();
+      const res = await ctx.store.recall({ query: args.query, k: args.k, rerank: ctx.rerank === true });
+      return {
+        publicationId: stats.publicationId,
+        contentGeneration: stats.contentGeneration,
+        // Explicit rather than inferred from `contentGeneration !== null`: the four honest causes of
+        // a null stamp (never stamped, a legacy v1 stamp, invalidated by a mutation, a build in
+        // flight) all mean "do not treat these rows as a named build", and a consumer should not
+        // have to rediscover that rule. `health` carries invalidatedAt/Reason for the WHY.
+        generationValid: stats.contentGeneration !== null,
+        // This process's, not the publisher's (item 7): every input is process-local, so a manifest
+        // could never assert it and a caller comparing two loci needs each locus's own answer.
+        servingSignature: ctx.store.servingSignature(),
+        results: shapeRecall(res, await freshness(ctx, async () => stats.lastReindexAt)),
+      };
     },
   }),
   op({
@@ -258,6 +475,10 @@ export const operations: Operation[] = createRegistry([
     }),
     readonly: true,
     served: "fs", // NOT part of the index-served cross-star surface (graph-explorer read; banned cross-star)
+    // item 16: `served: "fs"` here means "keep it off the cross-star surface", NOT "reads files" —
+    // neighbors answers entirely out of the store, so a drifted scope leaks excluded pages' titles
+    // and ids through it exactly as it would through recall. Guarded.
+    scopeGuarded: true,
     async run(ctx, args) {
       return ctx.store.neighbors(args.id, args.k);
     },
@@ -273,6 +494,7 @@ export const operations: Operation[] = createRegistry([
     args: z.object({}),
     readonly: true,
     served: "fs", // constellation bake (writes a cache file beside pgdata); not the cross-star surface
+    scopeGuarded: true, // item 16: the baked artifact is every node in the index — same leak as neighbors
     async run(ctx) {
       return ctx.store.graph();
     },
@@ -283,20 +505,37 @@ export const operations: Operation[] = createRegistry([
     args: z.object({}),
     readonly: true,
     served: "index", // store stats only — servable on a cross-star surface (exempt from the scope guard)
+    // item 16 exemption, deliberate: `health` returns COUNTS and IDENTITY, never a page. It is also
+    // the op that REPORTS the built-versus-desired scope disagreement (item 20), so refusing it on
+    // that disagreement would withhold the diagnosis of the very condition being diagnosed — the
+    // same reason `--ops` mode keeps `health` while refusing `recall`. Cross-star callers get the
+    // guarded_health variant, which DOES check, because a hub caller cannot read this star's
+    // star.yaml for itself.
+    scopeGuarded: false,
     async run(ctx) {
       const stats = await ctx.store.stats();
-      // The CLI prints this on every query; an agent could not see it at all, so a model had no way
-      // to know its recall was answering from an index that predates the notes it is citing.
-      // Best-effort: a stat walk must never be the reason health fails.
-      let vaultChangedSinceReindex: boolean | null = null;
-      try {
-        const at = stats.lastReindexAt ? Date.parse(stats.lastReindexAt) : NaN;
-        if (!Number.isNaN(at)) {
-          const { vaultNewerThan } = await import("./reindex.ts");
-          vaultChangedSinceReindex = vaultNewerThan(ctx.vault, at);
-        }
-      } catch { /* unreadable vault — report unknown rather than failing health */ }
-      return { vault: ctx.vault, ...stats, vaultChangedSinceReindex };
+      // One definition of "has the vault moved" for health, recall and the CLI — and it walks the
+      // INDEXED corpus. This used to walk every .md under the vault, so a touched `node_modules/*.md`
+      // in a configless vault reported the index permanently stale; and on a `--cross-star` surface,
+      // which admits this op precisely because served:"index" promises no filesystem read, it stat'd
+      // the very paths index_scope exists to withhold.
+      const vaultChangedSinceReindex = await freshness(ctx, async () => stats.lastReindexAt);
+      // `generation` is a DEPRECATED ALIAS of `contentGeneration`, and the two faces must carry the
+      // same key names for the same value: `stats()` renamed its field in 0.3.0 item 8, and because
+      // this op spreads stats while the HTTP face `/health` names its keys, one rename silently gave
+      // one logical value two names on two faces — with twinkl.ing's memory block (MEMORY_SAFE_KEYS,
+      // gateway-proxy.ts) reading `generation` off exactly one of them. REMOVE both aliases in the
+      // release that also drops `recall` for `recall_v2` — the twinkl.ing cutover the plan names as
+      // an external release gate (item 19) — never before, and never on one face alone.
+      // 0.3.0 item 20: the operator-facing state contract, shared VERBATIM with `doctor` (one
+      // assembly in machine-state.ts, so the two faces cannot drift into two accounts of one
+      // machine). It is spread LAST but adds no key that `stats` already owns except by intent —
+      // `schemaVersion`, `publicationId`, `contentGeneration`, `invalidatedAt`, `invalidatedReason`
+      // and `ignoreScope` are the same values from the same snapshot, and the new keys are the ones
+      // that were previously unanswerable here: `generationValid`, `servingSignature`,
+      // `desiredScopeHash`/`scopeMatches`, `buildState`, `machineState`, `overrides`.
+      const state = await operatorState(ctx.store, ctx.vault, stats);
+      return { vault: ctx.vault, ...stats, generation: stats.contentGeneration, vaultChangedSinceReindex, ...state };
     },
   }),
   op({
@@ -308,6 +547,7 @@ export const operations: Operation[] = createRegistry([
     args: z.object({ n: count("max rows (default 20, max 100)", 20, 100) }),
     readonly: true,
     served: "index", // recall_stats telemetry from the store — no filesystem read
+    scopeGuarded: true, // item 16: hotlist returns titles and paths of indexed pages
     async run(ctx, args) {
       const tracking = ctx.store.recallTracking;
       return { tracking, items: tracking ? await ctx.store.hotlist(args.n) : [] };
@@ -326,53 +566,14 @@ export const operations: Operation[] = createRegistry([
     args: indexedPageArgs(),
     readonly: true,
     served: "index", // reads the DB snapshot only (no fs) — the cross-star read surface, no TOCTOU
+    scopeGuarded: true, // item 16: serves a whole page BODY out of the index
     async run(ctx, args) {
       const page = await ctx.store.indexedPage({ id: args.id, path: args.path });
       if (!page) throw new Error(`indexed_page: "${args.id ?? args.path}" is not in the index (unindexed, index_scope-excluded, or not found)`);
       return page;
     },
   }),
-  // ── H9 guarded cross-star reads (INTERNAL) — the daemon-side/atomic half of the --cross-star
-  //    surface. The client always names `recall`/`indexed_page`; mcp.ts translates those to the
-  //    guarded_* ops in --cross-star mode (direct AND over the daemon proxy), so the scope check +
-  //    the retrieval happen in ONE atomic guarded store read server-side. Each resolves the CURRENT
-  //    policy from ctx.vault's star.yaml itself (never a client-supplied hash), refusing when the
-  //    manifest is absent/invalid (H2) or the persisted signature is missing/ignored/stale/mid-reindex.
-  op({
-    name: "guarded_recall",
-    description: "Cross-star GUARDED recall (internal): atomically verifies the index_scope boundary and returns recall results in the same guarded read, or refuses. The daemon-side half of --ops --cross-star.",
-    args: z.object({
-      query: z.string().describe("free-text question"),
-      k: count("max results (default 5)", 5, 50),
-    }),
-    readonly: true,
-    served: "index",
-    internal: true,
-    async run(ctx, args) {
-      const expected = crossStarExpectedHash(ctx.vault);
-      if ("refusal" in expected) throw new Error(expected.refusal);
-      const res = await ctx.store.guardedRead(expected.hash, () =>
-        ctx.store.recall({ query: args.query, k: args.k, rerank: ctx.rerank === true }));
-      if ("refusal" in res) throw new Error(res.refusal);
-      return shapeRecall(res.ok);
-    },
-  }),
-  op({
-    name: "guarded_indexed_page",
-    description: "Cross-star GUARDED indexed_page (internal): atomic index_scope check + indexed-snapshot read in one guarded read, or refusal. The daemon-side half of --ops --cross-star.",
-    args: indexedPageArgs(),
-    readonly: true,
-    served: "index",
-    internal: true,
-    async run(ctx, args) {
-      const expected = crossStarExpectedHash(ctx.vault);
-      if ("refusal" in expected) throw new Error(expected.refusal);
-      const res = await ctx.store.guardedRead(expected.hash, () => ctx.store.indexedPage({ id: args.id, path: args.path }));
-      if ("refusal" in res) throw new Error(res.refusal);
-      if (!res.ok) throw new Error(`indexed_page: "${args.id ?? args.path}" is not in the index (unindexed, index_scope-excluded, or not found)`);
-      return res.ok;
-    },
-  }),
+  ...HUB_READ_OPS,
   // ── S3 mutating ops — all through FunesStore: out_memory/ only (assertOwned), sanitized,
   //    markdown written first, trust server-stamped untrusted. No trust argument exists.
   op({
@@ -419,7 +620,11 @@ export const operations: Operation[] = createRegistry([
       type: optionalText("optional item type"),
       // P5.19: a successor that cannot restate its own volatility silently DEMOTES a state claim to
       // an event — the exact failure supersession exists to prevent.
-      volatile: z.boolean().describe("true if the successor is still a STATE that later writes should replace").optional().transform((v) => v === true),
+      // cf8e976 retired the "later writes should replace" promise from `remember` and missed this
+      // twin, so the same unkeepable claim survived on the op whose whole purpose is replacement —
+      // where a caller is most likely to read it as a guarantee. There is still no claim key to
+      // supersede BY; replacement is an act someone performs, not something funes does.
+      volatile: z.boolean().describe("true if the successor is still a STATE that goes stale and should be replaced by a later write; false/omitted records it as an append-only EVENT. Recorded and returned by recall; supersession is still an explicit act, not automatic").optional().transform((v) => v === true),
       as_of: isoDate("when the successor's claim became true (ISO date)"),
       tags: z.string().describe("optional comma-separated tags").optional(),
     }),
@@ -509,6 +714,42 @@ export async function dispatchToolCall(
 ): Promise<unknown> {
   const op = ops.find((o) => o.name === name);
   if (!op) throw new Error(`unknown operation: ${name}`);
+  // 0.3.0 item 25 (ADR-0005) — THE canonical-vault mutation boundary. Every mutating op in this
+  // registry writes canonical markdown (`served: "fs"`), and every served surface — the broker
+  // face, stdio MCP, the daemon proxy — dispatches through here, so this is ONE place rather than a
+  // convention repeated in three. It does NOT gate a machine rebuilding its own derived index:
+  // reindex never comes through this dispatcher, which is exactly the narrowing ADR-0005 demands.
+  // It runs AFTER the argument gate on purpose — a request that fails its schema never became a
+  // write, and auditing it would fill an operator's log with rejected garbage. 0.3.0 ships `audit`,
+  // so the decision is reported and the write proceeds; the `enforce` branch, when the estate
+  // declares write_authority everywhere, refuses HERE on `!decision.allowed`.
+  const parsed = parseOpArgs(op, name, args);
+  if (!op.readonly) {
+    const designation = ctx.designation ?? resolveWriteDesignation(ctx.vault);
+    reportWriteDecision(authorizeCanonicalWrite(designation, { op: name, vault: ctx.vault, actor: ctx.actor }));
+  }
+  // 0.3.0 item 16 — THE own-star index_scope guard, here because every served surface (the broker
+  // and read faces, stdio MCP, the daemon proxy, the funes-api HTTP surface) dispatches through
+  // this one function. Until now the guard ran ONLY inside the three `guarded_*` ops, which only
+  // `--cross-star` mode reaches — so an operator who narrowed `star.yaml` and had not yet
+  // reindexed went on serving the withdrawn pages to every LOCAL client, indefinitely, with no
+  // signal anywhere. The check-retrieve-RECHECK shape is the store's `guardedRead`: the desired
+  // scope is recomputed from live `star.yaml` on BOTH ends, so a manifest that narrows during the
+  // read refuses on the way out.
+  //
+  // The `guarded_*` ops are `internal` and guard themselves against the stricter cross-star
+  // expectation; wrapping them again here would only ask a weaker question after a stronger one.
+  if (op.scopeGuarded && !op.internal) {
+    const res = await ctx.store.guardedRead(ownStarExpectation(ctx.vault), () => op.run(ctx, parsed));
+    if ("refusal" in res) throw new Error(res.refusal);
+    return res.ok;
+  }
+  return op.run(ctx, parsed);
+}
+
+/** The ONE argument gate, shared by both dispatchers — the hub must refuse exactly what the MCP
+ *  surface refuses, in exactly the same words. */
+function parseOpArgs(op: { inputSchema: OpInputSchema; args: z.ZodType }, name: string, args: Record<string, unknown>): unknown {
   // Required-presence runs BEFORE the schema so the long-standing wording survives: zod would say
   // "expected string, received undefined", which reads like a type error rather than a missing arg.
   for (const req of op.inputSchema.required ?? []) {
@@ -516,5 +757,5 @@ export async function dispatchToolCall(
   }
   const parsed = op.args.safeParse(args);
   if (!parsed.success) throw argError(name, parsed.error);
-  return op.run(ctx, parsed.data);
+  return parsed.data;
 }

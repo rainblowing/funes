@@ -8,15 +8,19 @@
 //
 // Both backends implement the shared FunesIndexStore (step 2b), so makeStore returns it with no cast.
 // Default stays "pglite" until the libSQL recall-parity decision; FUNES_BACKEND=libsql opts in.
-import { existsSync, linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { Embedder } from "funes-core";
+// manifest-v3 (PRD 2026-08-27): the identity grammar. funes-core owns it (D12).
+import { canonicalKey, embeddingSignature } from "funes-core";
+import { INDEX_SCHEMA_VERSION } from "funes-shared";
 import type { FunesIndexStore } from "./store.ts";
-import { E5Embedder } from "./embedder.ts";
+import { CHUNK_SIG, E5Embedder } from "./embedder.ts";
 import { CrossEncoderReranker, type Reranker } from "./rerank.ts";
 import { LIBSQL_ONLY } from "./artifact.ts";
+import { assertIndexNotInSyncRoot } from "./sync-root.ts";
 
 // libSQL is the default + only LOCAL backend (2026-07-20, PGLite removed). `postgres` is the deferred
 // profile-B server tier (node-postgres via postgres-driver.ts + the shared Postgres-dialect store),
@@ -48,17 +52,56 @@ export function funesDbDir(vault: string, backend: FunesBackend = funesBackend()
  *  knows WHICH STAR it belongs to — identity is the stable sync URI (ADR-0002), not the machine
  *  path. Absent star.yaml / meta.id -> null id (lone/grandfathered star; the guard falls back to
  *  the vault path, today's behaviour). */
-export interface StarIdentity { id: string | null; name: string | null; constellation: string | null; }
+export interface StarIdentity {
+  id: string | null;
+  name: string | null;
+  constellation: string | null;
+  /** manifest-v3 (PRD 2026-08-27 D1): the CANONICAL KEY of `id` — `<domain>/<workname>`, or null
+   *  when the id predates the grammar. Identity comparisons use this when both sides have one, so
+   *  a star that changes transport keeps its index instead of tripping the collision guard. */
+  key: string | null;
+  /** manifest-v3 (D9): the declared capabilities, with the defaults that describe the estate as it
+   *  already is. A v2 star.yaml — which is every star today — yields exactly the defaults. */
+  capabilities: StarCapabilities;
+  /** ADR-0005: the locus DECLARED to hold write authority over this star. Present in star.yaml
+   *  since the manifest existed and read by no code until 0.3.0 item 25 — see write-designation.ts.
+   *  Null when undeclared, which is six of the eight catalogued stars today. */
+  writeAuthority: string | null;
+}
+/** The three declared capabilities. See funes-core's star-uri.ts for the identity half of v3. */
+export interface StarCapabilities { okf: "0.1" | "0.2" | false; graph: boolean; code: boolean }
+export const DEFAULT_STAR_CAPABILITIES: StarCapabilities = { okf: "0.2", graph: true, code: false };
+
+function readCapabilities(memory: Record<string, unknown>): StarCapabilities {
+  const okf = memory.okf === false || memory.okf === "0.1" || memory.okf === "0.2"
+    ? (memory.okf as StarCapabilities["okf"])
+    : DEFAULT_STAR_CAPABILITIES.okf;
+  return {
+    okf,
+    graph: typeof memory.graph === "boolean" ? memory.graph : DEFAULT_STAR_CAPABILITIES.graph,
+    code: typeof memory.code === "boolean" ? memory.code : DEFAULT_STAR_CAPABILITIES.code,
+  };
+}
+
 export function readStarIdentity(vault: string): StarIdentity {
+  const none: StarIdentity = { id: null, name: null, constellation: null, key: null, capabilities: { ...DEFAULT_STAR_CAPABILITIES }, writeAuthority: null };
   const p = join(vault, "star.yaml");
-  if (!existsSync(p)) return { id: null, name: null, constellation: null };
+  if (!existsSync(p)) return none;
   try {
-    const data = parseYaml(readFileSync(p, "utf8")) as { meta?: Record<string, unknown> } | null;
+    const data = parseYaml(readFileSync(p, "utf8")) as { meta?: Record<string, unknown>; memory?: Record<string, unknown> } | null;
     const meta = data?.meta ?? {};
     const s = (v: unknown) => (typeof v === "string" ? v : null);
-    return { id: s(meta.id), name: s(meta.name), constellation: s(meta.constellation) };
+    const id = s(meta.id);
+    return {
+      id,
+      name: s(meta.name),
+      constellation: s(meta.constellation),
+      key: id ? canonicalKey(id) : null,
+      capabilities: readCapabilities(data?.memory ?? {}),
+      writeAuthority: s(meta.write_authority),
+    };
   } catch {
-    return { id: null, name: null, constellation: null }; // malformed -> path fallback, never a crash
+    return none; // malformed -> path fallback, never a crash
   }
 }
 
@@ -125,13 +168,20 @@ function assertOwnerAgainst(
 
   // Both sides have a star identity -> ids are authoritative (path may legitimately differ).
   if (current.id && mine.id) {
-    if (current.id !== mine.id) {
+    // manifest-v3 (PRD 2026-08-27 D1): compare CANONICAL KEYS when both sides have one, so a star
+    // that changed transport — one access scheme re-declared as another — keeps its index
+    // instead of reading as a different star. Falls back to string equality when either side
+    // predates the grammar, which is every star until the renumber runs, so today's behaviour is
+    // bit-for-bit unchanged. This is a WIDENING of what counts as the same star, never a
+    // narrowing: nothing that used to match stops matching.
+    const same = current.id === mine.id || (canonicalKey(current.id) !== null && canonicalKey(current.id) === canonicalKey(mine.id));
+    if (!same) {
       throw new Error(
         `funes: index collision — ${indexDir} belongs to star "${current.id}"${current.star ? ` (${current.star})` : ""}, ` +
         `but "${vault}" is star "${mine.id}". Set FUNES_LIBSQL_DIR for one of them, or rename a folder.`,
       );
     }
-    if (current.vault !== me) writeMine(); // same star, moved on disk -> record the new materialization
+    if (current.vault !== me || current.id !== mine.id) writeMine(); // moved on disk, or re-rendered under a new access method
     return;
   }
   // Fallback (one/both sides lack an id): compare the materialization path, as before.
@@ -142,6 +192,94 @@ function assertOwnerAgainst(
     );
   }
   if (!current.id && mine.id) writeMine(); // legacy path-only marker, this star now has an id -> upgrade
+}
+
+/** Rewrite the owner marker of `indexDir` from one identity to another — the FIFTH layer of the
+ *  renumber (`twinkling star reid`, RAI-49). Nothing else may move a marker.
+ *
+ *  The guard above is a hard stop by design, and this does not soften it: the caller must name the
+ *  identity it expects to find, and a marker holding anything else refuses. That is what makes the
+ *  renumber safe to re-run — a second pass over an already-renumbered star reports `already`, and a
+ *  pass against the wrong index reports `refused` instead of stealing it.
+ *
+ *  Returns what happened, so a --dry-run can print the plan without writing. */
+export function rewriteIndexOwner(
+  indexDir: string,
+  opts: { expectedId: string; newId: string; star?: string | null; constellation?: string | null; dryRun?: boolean },
+): { outcome: "rewritten" | "already" | "absent" | "refused"; detail: string } {
+  const markerPath = join(indexDir, "owner-vault");
+  const current = readMarker(markerPath);
+  if (!current) return { outcome: "absent", detail: `no owner marker at ${markerPath}` };
+  if (current.id === opts.newId) return { outcome: "already", detail: `marker already holds "${opts.newId}"` };
+  if (current.id !== opts.expectedId) {
+    return { outcome: "refused", detail: `marker holds "${current.id ?? "(path-only)"}", expected "${opts.expectedId}"` };
+  }
+  if (opts.dryRun) return { outcome: "rewritten", detail: `would rewrite "${opts.expectedId}" -> "${opts.newId}"` };
+  const payload = JSON.stringify({
+    id: opts.newId,
+    vault: current.vault,
+    star: opts.star ?? current.star ?? null,
+    constellation: opts.constellation ?? current.constellation ?? null,
+  }) + "\n";
+  // Write through a temp + rename so a crash mid-write cannot leave a half marker, which the
+  // guard would then read as a path-only legacy marker and silently "upgrade".
+  const tmp = `${markerPath}.${process.pid}.reid`;
+  writeFileSync(tmp, payload);
+  renameSync(tmp, markerPath);
+  return { outcome: "rewritten", detail: `"${opts.expectedId}" -> "${opts.newId}"` };
+}
+
+/** `reindex --fresh`'s PRE-OPEN repair (0.3.0 close-out, the schema fence).
+ *
+ *  The fence (PLAN-0.3.0 R2#2) makes a read-write open REFUSE any index whose `schema_version` is
+ *  not exactly INDEX_SCHEMA_VERSION, and the H1 drift guard has always refused a mismatched
+ *  embedding signature. `--fresh` wipes with `prune([])` — INSIDE an open store — so after the fence
+ *  the repair verb refused its own patient: the one index that most needs rebuilding is the one it
+ *  could not open. So the wipe of a stale index happens here, on the files, BEFORE the store opens,
+ *  and only for the two conditions the open itself would refuse; a current, matching index is left
+ *  for the ordinary in-epoch wipe, which keeps the dirty marker over the rebuild.
+ *
+ *  Ordered like the normal opener, because a removal must clear every check an open would: the
+ *  caller has already run the daemon probe; this runs the owner-marker/star-identity guard (a
+ *  foreign star's index is refused BEFORE it is deleted) and the sync-root guard, and the caller
+ *  holds the index's write lock across inspection, removal and the first open so no other funes
+ *  writer can open the file between the two.
+ *
+ *  Inspection is a raw read-only `bun:sqlite` handle, not `LibsqlStore.create`: that opener is the
+ *  thing that refuses. ponytail: same ceiling as `readPublishedMeta` (publication.ts) — Bun-only,
+ *  dynamically imported inside a CLI-only verb, so no serving path evaluates it. A file the handle
+ *  cannot read as a funes index is NOT removed: a repair that cannot inspect its patient says so
+ *  rather than deleting on a guess. */
+export async function repairIndexForFresh(opts: { vault: string; dbPath: string; embedder: Embedder }): Promise<"removed" | "kept" | "absent"> {
+  assertIndexOwner(dirname(opts.dbPath), opts.vault);
+  assertIndexNotInSyncRoot(opts.dbPath);
+  if (!existsSync(opts.dbPath)) return "absent";
+  let meta: Record<string, string>;
+  try {
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(opts.dbPath, { readonly: true });
+    try {
+      meta = Object.fromEntries((db.query("select key, value from meta").all() as Array<{ key: string; value: string }>).map((r) => [r.key, r.value]));
+    } finally {
+      db.close();
+    }
+  } catch (e) {
+    throw new Error(`funes: reindex --fresh cannot inspect the index at ${opts.dbPath} (${(e as Error).message}) — not removing it; delete it by hand if it is not a funes index.`);
+  }
+  const sig = `${embeddingSignature(opts.embedder)}:${CHUNK_SIG}`;
+  const staleSchema = meta.schema_version !== INDEX_SCHEMA_VERSION;
+  // An absent signature is grandfathered by the open (it stamps one), so only a DIFFERENT one is drift.
+  const drifted = meta.embedding_signature != null && meta.embedding_signature !== sig;
+  if (!staleSchema && !drifted) return "kept";
+  process.stderr.write(
+    `reindex --fresh: removing the index at ${opts.dbPath} before the rebuild — ` +
+    (staleSchema ? `schema_version "${meta.schema_version ?? "pre-2"}" != "${INDEX_SCHEMA_VERSION}"` : `embedding signature "${meta.embedding_signature}" != "${sig}"`) +
+    " (a read-write open would refuse it).\n",
+  );
+  // Mirrors publication.ts's rmDbFiles (module-private there, and it also drops a publication-only
+  // retention pin this live index never has).
+  for (const suffix of ["", "-wal", "-shm", "-journal"]) rmSync(opts.dbPath + suffix, { force: true });
+  return "removed";
 }
 
 export interface MakeStoreOpts {
@@ -188,6 +326,11 @@ export async function makeStore(opts: MakeStoreOpts = {}): Promise<FunesIndexSto
   if (backend === "libsql" && opts.vault != null && dbDir != null && !opts.readonly) {
     assertIndexOwner(dirname(dbDir), opts.vault);
   }
+  // 0.3.0 item 23: the index may not live inside a sync provider's root. Checked at the ONE
+  // construction point, on read-only opens too — a torn database serves torn answers whoever opened
+  // it — and against the INDEX path only: a vault under Syncthing/Dropbox is the estate's normal
+  // shape and stays permitted.
+  if (backend === "libsql" && dbDir != null) assertIndexNotInSyncRoot(dbDir);
   const embedder = opts.embedder ?? new E5Embedder();
   const reranker = opts.reranker ?? (opts.rerank ? new CrossEncoderReranker() : undefined);
   if (backend === "postgres") {
@@ -195,6 +338,20 @@ export async function makeStore(opts: MakeStoreOpts = {}): Promise<FunesIndexSto
     // the failure is a deliberate sentence rather than an obscure module-resolution error.
     if (LIBSQL_ONLY) {
       throw new Error('funes: FUNES_BACKEND=postgres is not available in this build — @funes-tech/cli ships the libsql path only. Run funes from source for the Postgres tier.');
+    }
+    // 0.3.0 P0.4: PARKED. PostgresStore neither persists nor validates `schema_version`, so an old
+    // Postgres writer would mutate beside new code without clearing the new content generation —
+    // and no fence this release adds can stop it without credential rotation or a server-side
+    // protocol gate. The tier is EXPERIMENTAL, benched only on docker and never run against a live
+    // cluster, so refusing costs nothing real. The live smoke test sets the escape, so CI keeps its
+    // coverage. Same shape as the LIBSQL_ONLY refusal above: throw before a path or a driver, so
+    // the failure is a sentence rather than an obscure resolution error.
+    if (process.env.FUNES_PG_UNSAFE !== "1") {
+      throw new Error(
+        'funes: the postgres backend is parked for 0.3.0 — PostgresStore does not persist or validate schema_version, ' +
+        'so an old writer can mutate an index without clearing its content generation and no fence can stop it. ' +
+        'Use the libsql backend, or set FUNES_PG_UNSAFE=1 to run the experimental tier anyway.',
+      );
     }
     // Server tier (ADR-0001 §1): the SAME store over node-postgres. Database-per-star,
     // role-per-star — the connection string IS the star scoping; no vault-derived path exists.

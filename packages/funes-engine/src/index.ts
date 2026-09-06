@@ -2,6 +2,9 @@ export { PostgresStore, ftsQuery, vecLiteral } from "./store.ts";
 export type { HotlistRow, GraphArtifact, GraphNode, GraphEdge, NeighborsResult, FunesIndexStore } from "./store.ts";
 export { makeStore, funesBackend, funesDbDir } from "./factory.ts";
 export type { FunesBackend, MakeStoreOpts } from "./factory.ts";
+// manifest-v3 (PRD 2026-08-27): the star.yaml read path + the renumber's owner-marker seam.
+export { readStarIdentity, rewriteIndexOwner, DEFAULT_STAR_CAPABILITIES } from "./factory.ts";
+export type { StarIdentity, StarCapabilities } from "./factory.ts";
 export { FunesStore } from "./funes-store.ts";
 export type { FunesStoreOpts } from "./funes-store.ts";
 export { E5Embedder, E5_MODEL, E5_DIM } from "./embedder.ts";
@@ -20,7 +23,7 @@ export { operations, createRegistry, buildToolDefs, dispatchToolCall, opCapabili
 export type { Operation, OperationContext, McpToolDef, OpCapability } from "./ops.ts";
 export { buildApp } from "./app.ts";
 export type { BuildAppOpts } from "./app.ts";
-export { startDaemon } from "./daemon.ts";
+export { startDaemon, capabilityAuthorizer } from "./daemon.ts";
 export type { DaemonOpts } from "./daemon.ts";
 export { daemonProbe, DEFAULT_DAEMON_PORT } from "./daemon-client.ts";
 export type { DaemonClient } from "./daemon-client.ts";
@@ -46,5 +49,13 @@ export type { GenerationManifest, PublishReindexOpts, PublishReindexResult, Publ
 export { coordinationDir, withCoordination } from "./coordination.ts";
 // the memory service's HTTP faces (broker/read; re-homing Phase R1/R2) — startFace is the
 // composition's entrypoint (face.ts also runs directly via `bun src/face.ts --face …`).
-export { startFace, makeFaceDeps, resolveFaceOps, resolveBrokerOps, assertBindPolicy, DEFAULT_BROKER_OPS, DEFAULT_READ_OPS } from "./face.ts";
+export { startFace, makeFaceDeps, resolveFaceOps, resolveBrokerOps, assertBindPolicy, resolveBindAllowlist, parseBindAllowlist, isLoopbackBind, DEFAULT_BIND_ALLOW, DEFAULT_BROKER_OPS, DEFAULT_READ_OPS } from "./face.ts";
 export type { FaceKind, FaceOpts, FaceStoreOpts, FaceDeps, ServeContext, RunningFace } from "./face.ts";
+// 0.3.0 P4 — the security surfaces: where a write's actor comes from (24), which deployment may
+// mutate a canonical vault (25), and where an index may not live (23).
+export { resolveWriteActor, loadActorMap, actorForCapability, assertActorName, UNKNOWN_ACTOR } from "./actor.ts";
+export type { ActorConfig } from "./actor.ts";
+export { authorizeCanonicalWrite, reportWriteDecision, resolveWriteDesignation, resolveDesignationMode, normalizeDesignation } from "./write-designation.ts";
+export type { DesignationMode, WriteDesignation, WriteDecision, WriteVerdict } from "./write-designation.ts";
+export { assertIndexNotInSyncRoot, findSyncRoot, canonicalizeExisting, syncRootOverrides } from "./sync-root.ts";
+export type { SyncRootFinding } from "./sync-root.ts";

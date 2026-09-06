@@ -39,6 +39,22 @@ test("libsql enrich: a description-only edit syncs the column without a re-embed
   expect(res.find((r) => r.id === "notes/beta")?.description).toBe("second");
 });
 
+test("libsql enrich: a resource-only edit syncs the column without a re-embed (hash-skipped path)", async () => {
+  // `resource` rides the same metadata-sync UPDATE as description, but nothing held its column
+  // there: the description case above matches on FTS, which resource never enters, so dropping
+  // `resource=?` from that statement failed no test. Confirmed by writing null on that path
+  // instead — the second read below then still says "first".
+  const s = await LibsqlStore.create(fakeEmbedder, ":memory:");
+  const base = { id: "notes/delta", title: "Delta", type: "note", body: "stable body text", trust: "trusted" as const };
+  await s.remember([{ ...base, resource: "https://example.com/first" }]);
+  const r = await s.remember([{ ...base, resource: "https://example.com/second" }]); // same title/body ⇒ hash unchanged
+  expect(r.skipped).toBe(1);                                                         // proves the metadata-sync path, not a re-embed
+  expect((await s.indexedPage({ id: "notes/delta" }))!.resource).toBe("https://example.com/second");
+  // …and clearing it clears the column, rather than leaving a stale link behind a null
+  await s.remember([{ ...base }]);
+  expect((await s.indexedPage({ id: "notes/delta" }))!.resource).toBeNull();
+});
+
 test("libsql enrich: legacy-schema migration ALTERs description/resource onto a pre-enrich index (Gate A-6)", async () => {
   const dbPath = join(mkdtempSync(join(tmpdir(), "funes-libsql-legacy-")), "idx.db");
   // Build a current store, then strip the enrich columns to simulate a pre-2026-07 index.
@@ -70,4 +86,19 @@ test("libsql enrich: the FTS row is refreshed when description changes on a hash
   const row = new Database(dbPath).prepare("select description from nodes_fts where nid=?").get("notes/beta") as { description: string };
   expect(row.description).toContain("borzoi");        // FTS refreshed to the new description
   expect(row.description).not.toContain("aardvark");  // the stale description is gone
+});
+
+test("libsql enrich: a type-only edit syncs the column without a re-embed (hash-skipped path)", async () => {
+  // `type` was the one widened field the hash-skipped UPDATE never wrote. Harmless while it was
+  // invisible to the identity; a lie once the content generation (PLAN-0.3.0 item 6) names it —
+  // the recomputed publication target would move while the built index still held the old value.
+  const s = await LibsqlStore.create(fakeEmbedder, ":memory:");
+  const base = { id: "notes/gamma", title: "Gamma", body: "stable body text", trust: "trusted" as const };
+  await s.remember([{ ...base, type: "note" }]);
+  const r = await s.remember([{ ...base, type: "decision" }]); // same title/body ⇒ hash unchanged
+  expect(r.skipped).toBe(1);                                   // proves the metadata-sync path, not a re-embed
+  expect((await s.indexedPage({ id: "notes/gamma" }))!.type).toBe("decision");
+  // …and clearing it clears the column, rather than leaving a stale value behind a null
+  await s.remember([{ ...base }]);
+  expect((await s.indexedPage({ id: "notes/gamma" }))!.type).toBeNull();
 });

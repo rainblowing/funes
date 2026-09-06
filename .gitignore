@@ -11,3 +11,18 @@ dist-pkg/
 # more: --push runs `bun install` inside it to verify the projected tree, so it carries a full
 # node_modules (~600MB) that a stray `git add -A` would try to commit into the private vault.
 dist-public/
+
+# archify visual-check evidence — regenerable from the .json spec, never a deliverable
+docs/*.visual-check.*
+
+# Syncthing transport litter (star pilot 2026-09-01) — the repo is a synced star; these are
+# the syncer's, never the repo's. Mirrored in star.yaml index_scope.exclude for recall.
+.stfolder/
+.stversions/
+*.sync-conflict-*
+
+# OKF bundle home returned in-star (ADR-0006) — derived, regenerable, plus the exporter's
+# transactional litter that lives in the vault root only mid-promotion.
+out_okf/
+.okf-tmp-*
+.okf-bak-*

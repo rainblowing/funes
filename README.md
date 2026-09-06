@@ -21,8 +21,9 @@ one. Nothing shortens your text today.)
 npm i -g @funes-tech/cli@alpha
 ```
 
-The alpha is on both the `alpha` and `latest` dist-tags, so a bare `npm i @funes-tech/cli` gets the
-same thing. Pinning `@alpha` documents the intent and keeps working when `latest` moves on.
+Ask for `@alpha` explicitly. The release pipeline only ever moves the `alpha` dist-tag for a
+prerelease, so `latest` is not guaranteed to track the current alpha and a bare
+`npm i @funes-tech/cli` can hand you an older build.
 
 Two things to know before you run it:
 
@@ -46,8 +47,12 @@ Then give an agent access over MCP:
 claude mcp add funes -- funes mcp --vault ./notes
 ```
 
-That exposes eleven tools: `recall`, `page`, `tree`, `neighbors`, `graph`, `health`, `hotlist`,
-`indexed_page`, and the mutations `remember`, `supersede`, `forget`.
+That exposes twelve tools: `recall`, `recall_v2`, `page`, `tree`, `neighbors`, `graph`, `health`,
+`hotlist`, `indexed_page`, and the mutations `remember`, `supersede`, `forget`. `recall_v2` returns
+the same results as `recall` inside an envelope — `{ publicationId, contentGeneration,
+generationValid, servingSignature, results }` — so a consumer can tell which published artefact
+answered, whether its content stamp is still valid, and what ranking settings the serving process
+fused with. `recall` stays until consumers have moved.
 
 Agent writes land in `out_memory/<id>.md` as ordinary markdown, recorded **untrusted** — or in
 `out/out_memory/` if your vault already has an `out/` directory, so read the path off the write
@@ -78,8 +83,10 @@ from scratch reproduces the same state. That is the design bet: **the database i
 
 Two things are honestly index-only, and a rebuild loses them: recall telemetry (`--stats` counters,
 advisory and never used for ranking), and `writeActor`, the principal recorded against a write.
-`writeActor` is worse than lost — a reindex re-`remember`s every live file through a store opened
-without an actor, which restamps it. Do not treat it as an audit trail until that is fixed.
+An ordinary reindex no longer overwrites a stamped `writeActor` with `unknown`, but it is still
+last-writer-wins between real principals, and a from-scratch rebuild — `reindex --fresh`, or simply
+a new index file — starts it empty. Treat it as provenance, not as an audit trail; the durable fix
+is an append-only ledger.
 
 ## Honest limits
 
@@ -94,10 +101,36 @@ without an actor, which restamps it. Do not treat it as an audit trail until tha
 - **The index lives outside your vault**, under `~/.twinkling/` in this release — a name inherited
   from the harness funes was extracted from. It moves to `~/.funes/` in a later release.
   `FUNES_LIBSQL_DIR` overrides it.
+- **The index refuses to live inside a sync root.** A live SQLite database whose `-wal`/`-shm` a
+  provider copies independently is a torn database, not a replica, so an index path under a
+  Syncthing, Dropbox or Resilio root refuses to open (the vault may be synced; the index may not).
+  `FUNES_SYNC_ROOT_OK` names EXACT index paths (comma-separated) that may open anyway; each one
+  warns on every open and `funes doctor` reports it for as long as it is set.
+- **A serving face binds loopback unless told otherwise.** `--bind-allow <ip>` (or
+  `FUNES_FACE_BIND_ALLOW`) names the exact address a face may listen on — IP literals only, parsed
+  fail-closed — and a non-loopback face refuses `page`, `tree`, `neighbors` and `graph` outright.
+  The faces are source-only in this release.
+- **A write's actor comes from process configuration, never from the request.** `--actor <name>`
+  (or `FUNES_ACTOR`) names the writing process; `--actor-map <file>` derives it from the presented
+  capability instead. No operation declares an actor argument, so there is nothing to ignore at
+  runtime; without a trusted source the row records `unknown`.
 - `FUNES_DEBUG=1` turns a one-line error into a stack trace.
-- **Model weights cache in `~/.twinkling/models`** (~145 MB, `FUNES_MODEL_DIR` overrides). It is
+- **Model weights cache in `~/.twinkling/models`** (135 MB, `FUNES_MODEL_DIR` overrides). It is
   outside `node_modules` deliberately, so upgrading the CLI does not re-download them.
 - `funes --help` lists every command. `--vault` defaults to the current directory.
+
+## Operating a locus
+
+0.3.0 moves the index schema to `4`. A read-only open accepts a `3` or a `4` index; a read-write open
+refuses anything but `4` and names the repair. So a schema-`3` live index — one built by 0.2.x —
+refuses every writer-capable process (the CLI, the stdio MCP server, the daemon) until
+`funes reindex --fresh` rebuilds it from the markdown; a published home rebuilds with
+`funes publish`. The refusal is the point: a `3` writer can no longer mutate a `4` artefact without
+invalidating its content stamp, which is what makes two machines comparable. On each machine, in
+this order: stop every process that can write (`funes mcp` without `--readonly`, the daemon); run
+`funes reindex --fresh` on every live index and `funes publish` on every published home; restart
+readers (`funes mcp --readonly`, read faces) — agents keep recall through those during the window;
+restart writers only once `funes doctor` reports a valid content generation on every home.
 
 ## Numbers, and what they mean
 

@@ -78,6 +78,13 @@ test("libsql: scope signature roundtrip (parity with pglite) + surfaced in stats
   await s.close();
 });
 
+
+/** PLAN-0.3.0 item 16: `guardedRead` now takes the desired scope as a THUNK, re-evaluated on both
+ *  checks, so a `star.yaml` that narrows mid-read refuses on the way out. These cases pin the BUILT
+ *  scope's behaviour, where the desired half is fixed — this wraps a constant hash in the
+ *  cross-star expectation (refuseWhileDirty: true), which is exactly what they asserted before. */
+const xs = (hash: string) => () => ({ hash, refuseWhileDirty: true });
+
 test("libsql: guardedRead H9 parity — holds on a matching sig, refuses on mismatch/ignore/missing/dirty, and re-checks after retrieval", async () => {
   const s = await LibsqlStore.create(new FakeEmbedder());
   await s.remember(ITEMS);
@@ -85,28 +92,28 @@ test("libsql: guardedRead H9 parity — holds on a matching sig, refuses on mism
   const HASH = scopeHash(["raw/**"]);
   await s.setScopeSignature({ hash: HASH, ignoreScope: false });
 
-  const ok = await s.guardedRead(HASH, () => s.recall({ query: "rye starter hydration", k: 3 }));
+  const ok = await s.guardedRead(xs(HASH), () => s.recall({ query: "rye starter hydration", k: 3 }));
   expect("ok" in ok).toBe(true);
 
-  const mm = await s.guardedRead(scopeHash(["other/**"]), () => s.recall({ query: "rye", k: 3 }));
+  const mm = await s.guardedRead(xs(scopeHash(["other/**"])), () => s.recall({ query: "rye", k: 3 }));
   expect((mm as { refusal: string }).refusal).toContain("scope-hash mismatch");
 
   await s.setScopeSignature({ hash: HASH, ignoreScope: true });
-  const ig = await s.guardedRead(HASH, () => s.recall({ query: "rye", k: 3 }));
+  const ig = await s.guardedRead(xs(HASH), () => s.recall({ query: "rye", k: 3 }));
   expect((ig as { refusal: string }).refusal).toContain("--ignore-scope");
 
   await s.clearScopeSignature();
-  const missing = await s.guardedRead(HASH, () => s.recall({ query: "rye", k: 3 }));
+  const missing = await s.guardedRead(xs(HASH), () => s.recall({ query: "rye", k: 3 }));
   expect((missing as { refusal: string }).refusal).toContain("no index_scope signature");
 
   // BARRIER: re-stamp a valid sig, then a reindex STARTS during retrieval -> the re-check refuses.
   await s.setScopeSignature({ hash: HASH, ignoreScope: false });
-  const barrier = await s.guardedRead(HASH, async () => {
+  const barrier = await s.guardedRead(xs(HASH), async () => {
     await s.beginReindex();
     return s.recall({ query: "rye", k: 3 });
   });
   expect((barrier as { refusal: string }).refusal).toContain("reindex is in progress");
-  await s.endReindex();
+  await s.finalizeReindex({ contentGeneration: "v2:" + "f".repeat(64) });
   await s.close();
 });
 
@@ -200,7 +207,7 @@ test("libsql: dirty-marker refuses normal open", async () => {
   const s = await LibsqlStore.create(new FakeEmbedder());
   await s.beginReindex();
   expect((await s.stats()).reindexDirty).toBe(true);
-  await s.endReindex();
+  await s.finalizeReindex({ contentGeneration: "v2:" + "f".repeat(64) });
   expect((await s.stats()).reindexDirty).toBe(false);
   await s.close();
 });

@@ -67,7 +67,12 @@ test("provenance: declared source/authored fold into the generation (a provenanc
   expect(encodeGeneration({ ...base, records: [{ ...rec, authored: "2026-01-01" }] })).not.toBe(g);
 });
 
-test("provenance: a pre-provenance (v2) index migrates additively on a writer open", async () => {
+// Until the 0.3.0 schema fence (PLAN-0.3.0 R2#2) this asserted the opposite: a "2" index MIGRATED
+// additively on a writer open and came back stamped "3". The version is a fence now — a writer at
+// any other version refuses and names the rebuild — so the same fixture asserts the refusal, and
+// that the refusal left the file exactly as it found it (no columns added, no stamp moved): a
+// refused open that half-migrated would be a third schema nothing can name.
+test("provenance: a pre-provenance (v2) index is REFUSED on a writer open, untouched, with the rebuild named", async () => {
   const dbPath = join(mkdtempSync(join(tmpdir(), "funes-prov-")), "idx.db");
   const s1 = await LibsqlStore.create(fake, dbPath);
   await s1.remember([{ id: "a", title: "A", body: "b" }]);
@@ -81,12 +86,12 @@ test("provenance: a pre-provenance (v2) index migrates additively on a writer op
     insert into meta(key,value) values ('schema_version','2') on conflict(key) do update set value='2';
   `);
   raw.close();
-  // reopen (writer): additive migration re-adds the columns + stamps 3
-  const s2 = await LibsqlStore.create(fake, dbPath);
-  const sv = (new Database(dbPath).prepare("select value from meta where key='schema_version'").get() as { value: string }).value;
-  expect(sv).toBe("3");
-  expect((await s2.indexedPage({ id: "a" }))!.writeActor).toBe("unknown"); // pre-existing row backfilled
-  await s2.close();
+  await expect(LibsqlStore.create(fake, dbPath)).rejects.toThrow(/schema_version "2" != "4".*reindex --fresh.*funes publish/s);
+  const after = new Database(dbPath);
+  expect((after.prepare("select value from meta where key='schema_version'").get() as { value: string }).value).toBe("2");
+  const cols = (after.prepare("pragma table_info(nodes)").all() as { name: string }[]).map((r) => r.name);
+  expect(cols).not.toContain("write_actor"); // the ladder is retired: nothing was added on the way out
+  after.close();
 });
 
 // A full reindex re-remembers every live file through a store opened with NO actor, whose default
