@@ -1,0 +1,294 @@
+# P3.15 P5 — the release gate.
+#
+# The shape matters more than the steps: ONE tarball is built, and that exact tarball — verified by
+# SHA-256 — is what every smoke job installs and what the publish job uploads. `npm pack` in each
+# matrix job would produce N different tarballs and publish an artifact nothing tested; `npm publish`
+# from source would re-run the build and ship bytes no job ever ran.
+#
+# Runs on every push (build + smoke, no publish) so the gate cannot rot between releases.
+#
+# PUBLISHING IS A SEPARATE ACT FROM TAGGING (2026-08-30). It used to be the same one: any pushed v*
+# tag published to npm, and the dist-tag is derived from the version, so a plain `0.2.1` would have
+# gone out as `latest`. That made "mark this commit as the release" and "ship it to every user of
+# `npm i -g`" one keystroke — and 0.2.1's own plan says, twice, to tag WITHOUT publishing. There was
+# no way to express that, so the tag could not be pushed at all.
+#
+# Now a tag push builds and smokes and stops. To publish, DISPATCH this workflow against the tag ref
+# with `publish: true`:
+#
+#   gh workflow run release.yml --ref v0.2.1 -f publish=true
+#
+# Both conditions are load-bearing. The ref must be a v* tag, because the publish step verifies the
+# packaged version against it and refuses a mismatch. The input must be ticked, because a dispatch
+# against a tag is otherwise a perfectly reasonable way to re-run a gate. This is deliberately not a
+# repository variable: a persistent flag is a hatch that stays open, and the whole point is that
+# each publish is decided once, on the day it happens.
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the tested tarball to npm. Only takes effect when dispatched against a v* TAG ref."
+        type: boolean
+        default: false
+
+# A release pushes main and its tag ATOMICALLY (scripts/export-public.ts), and GitHub answers one
+# such push with TWO workflow runs — one per ref. Both build and both run the full smoke matrix,
+# which means eight cold model downloads from one runner IP at once: the exact condition that got
+# HTTP 429'd by Hugging Face and read as flakiness. Serialize instead. cancel-in-progress is FALSE
+# on purpose — cancelling would race to kill a run that may be the publishing dispatch, and a
+# half-killed publish is worse than a slow queue.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# The bundler result is version-specific: the pinned BUN_VERSION (1.4.0 since 2026-08-24; 1.3.14
+# before) is what the shebang and single-file behaviour were verified against — the shebang
+# assertion below re-verifies it on every run. `latest` would silently change the artifact.
+env:
+  BUN_VERSION: "1.4.0"
+
+jobs:
+  pack:
+    name: build + pack once
+    runs-on: ubuntu-latest
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+      tarball: ${{ steps.pack.outputs.tarball }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.14"
+      - run: bun install --frozen-lockfile
+
+      # Asserts internally: node shebang emitted byte-for-byte, and the module graph carries no
+      # daemon/face/app/console.html/pg while daemon-client IS present.
+      - name: build the artifact
+        run: bun scripts/build-cli.ts --out dist-pkg
+
+      - name: pack
+        id: pack
+        working-directory: dist-pkg
+        run: |
+          set -euo pipefail
+          f=$(npm pack --silent)
+          echo "tarball=$f" >> "$GITHUB_OUTPUT"
+          mv "$f" "$GITHUB_WORKSPACE/$f"
+
+      # The tar listing is its own assertion: npm needs README and LICENSE INSIDE the package root,
+      # not merely at the monorepo root, or the package page renders empty.
+      - name: assert tar contents
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          list=$(tar -tzf "$TARBALL")
+          echo "$list"
+          # HERESTRINGS, never `echo "$x" | grep -q`. `grep -q` exits the instant it matches and
+          # closes the pipe; `echo` then dies of EPIPE, and `set -o pipefail` reports THAT as the
+          # pipeline's status. Whether echo finishes first is a race, and it fails both ways:
+          # `... || { exit 1; }` reports a present file as MISSING (seen on 2026-08-30), and the two
+          # `! ... ||` leak checks report a REAL leak as clean, because the inverted non-zero reads
+          # as success. A herestring has no pipeline, so there is nothing to race.
+          # npm-shrinkwrap.json is asserted here because its omission is SILENT: npm does not
+          # force-include it when `files` is set, so `npm pack` drops it with no warning and exit 0,
+          # and the tarball then looks locked while resolving ranges freely. build-cli.ts's `files`
+          # array is the only thing putting it in; this is the gate behind that one array literal.
+          for want in package/package.json package/dist/cli.js package/README.md package/LICENSE package/npm-shrinkwrap.json; do
+            grep -qx "$want" <<<"$list" || { echo "MISSING from tarball: $want"; exit 1; }
+          done
+          ! grep -q "\.test\.ts$" <<<"$list" || { echo "test files leaked into the tarball"; exit 1; }
+          ! grep -q "__fixtures__" <<<"$list" || { echo "fixtures leaked into the tarball"; exit 1; }
+
+      - name: hash
+        id: hash
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: echo "sha256=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: ${{ steps.pack.outputs.tarball }}
+          retention-days: 7
+
+  smoke:
+    name: smoke ${{ matrix.os }} / node ${{ matrix.node }}
+    needs: pack
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Serialized on purpose. Every job downloads the embedding model cold (see below), and four
+      # concurrent cold downloads from one runner IP range got HTTP 429'd by Hugging Face — which
+      # looked like flakiness moving between jobs. One at a time trades wall-clock for a gate that
+      # actually means something.
+      max-parallel: 1
+      matrix:
+        # macOS is not redundant: libsql, onnxruntime-node and sharp all ship per-platform optional
+        # binaries, and an Ubuntu-only gate proves nothing about them. 22.14 is the floor the
+        # manifest's engines field claims; 24 is the moving target.
+        os: [ubuntu-latest, macos-latest]
+        node: ["22.14", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball
+
+      # The whole point of the fan-out: prove this is the SAME artifact the pack job built.
+      - name: verify the tarball is byte-identical to the one that was built
+        shell: bash
+        env:
+          TARBALL: ${{ needs.pack.outputs.tarball }}
+          WANT_SHA: ${{ needs.pack.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          got=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)
+          [ "$got" = "$WANT_SHA" ] || { echo "sha mismatch: $got != $WANT_SHA"; exit 1; }
+
+      # A clean directory OUTSIDE the checkout: installing inside it would let the workspace resolve
+      # `funes-*` by symlink and hide exactly the packaging bug this gate exists to catch.
+      - name: clean install
+        shell: bash
+        env:
+          TARBALL: ${{ needs.pack.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/clean" && cd "$RUNNER_TEMP/clean"
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE/$TARBALL" --no-audit --no-fund --foreground-scripts
+
+      # bun is deliberately NOT installed on this job. The built shebang says `#!/usr/bin/env node`,
+      # and bun at the pinned BUN_VERSION does NOT rewrite it for --target=node — so without this,
+      # `node dist/cli.js` would pass while the command a user actually types dies on a machine
+      # without bun.
+      - name: smoke the installed command
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/clean"
+          BIN=node_modules/.bin/funes
+          grep -qx '#!/usr/bin/env node' <<<"$(head -1 node_modules/@funes-tech/cli/dist/cli.js)"
+          command -v bun && { echo "bun is on PATH — this job must prove the artifact runs without it"; exit 1; } || true
+
+          v=$("$BIN" --version)
+          manifest=$(node -p "require('./node_modules/@funes-tech/cli/package.json').version")
+          [ "$v" = "$manifest" ] || { echo "version drift: bin says $v, manifest says $manifest"; exit 1; }
+
+          # These exit non-zero BY DESIGN (usage=2, refusal=1), so capture first — piping them into
+          # grep under `set -o pipefail` fails the step on the LEFT side's status even when grep
+          # matches. Then feed grep by HERESTRING rather than `echo |`, for the EPIPE race above:
+          # `echo "$usage" | grep -q "publish" && { exit 1; }` would let a real hit pass silently
+          # whenever grep won, which is the assertion keeping `publish` out of the shipped bin.
+          usage=$("$BIN" 2>&1 || true)
+          grep -q "usage: funes" <<<"$usage"
+          grep -q "publish" <<<"$usage" && { echo "publish must not be in the published bin"; exit 1; }
+
+          refusal=$(FUNES_BACKEND=postgres "$BIN" query x --vault . 2>&1 || true)
+          grep -q "not available in this build" <<<"$refusal"
+          grep -qi "at makeStore\|node_modules" <<<"$refusal" && { echo "refusal leaked a stack trace"; exit 1; }
+          true
+
+      # No model cache is restored anywhere in this workflow ON PURPOSE: a GitHub runner is
+      # ephemeral, so every one of these is the stranger's genuine first run, model download and all.
+      # Caching would make the gate fast and stop it testing the thing most likely to break.
+      - name: end-to-end on a real vault (cold model download)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/clean"
+          BIN=$PWD/node_modules/.bin/funes
+          mkdir -p vault && cd vault
+          printf -- '---\ntitle: Fitness\n---\nprotein creatine goals\n' > fitness.md
+          printf -- '---\ntitle: Sailing\n---\nhybrid catamaran research\n' > sailing.md
+          export FUNES_LIBSQL_DIR="$RUNNER_TEMP/idx"
+
+          # Retry the cold path: the model download is a third-party network call, and a transient
+          # 429/5xx from Hugging Face is not a defect in the artifact. Three attempts with backoff;
+          # a genuine failure still fails the gate.
+          for attempt in 1 2 3; do
+            if time "$BIN" reindex --vault .; then break; fi
+            [ "$attempt" = 3 ] && { echo "reindex failed after 3 attempts"; exit 1; }
+            echo "reindex attempt $attempt failed — retrying in $((attempt * 20))s"
+            sleep $((attempt * 20))
+          done
+          grep -q fitness.md <<<"$("$BIN" query "protein creatine" --vault .)"
+          echo "a memory over a pipe" | "$BIN" remember --vault . --title "piped"
+          "$BIN" grandfather --vault .
+
+          # NOT `printf | funes mcp | grep -q`. `funes mcp` is a stdio SERVER: it does not exit when
+          # stdin reaches EOF, and `grep -q` exits the instant it matches, SIGPIPEing the server —
+          # which `set -o pipefail` then reports as the step's failure. Whether grep wins that race
+          # is timing-dependent, so it passed on Linux and flapped between the two macOS jobs.
+          printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n' > mcp-in.jsonl
+          "$BIN" mcp --vault . < mcp-in.jsonl > mcp-out.jsonl 2>mcp-err.log &
+          mcp_pid=$!
+          for _ in $(seq 1 30); do grep -q '"tools"' mcp-out.jsonl 2>/dev/null && break; sleep 1; done
+          kill "$mcp_pid" 2>/dev/null || true
+          grep -q '"tools"' mcp-out.jsonl || { echo "mcp tools/list produced nothing:"; cat mcp-err.log; exit 1; }
+
+  publish:
+    name: publish the tested tarball
+    needs: [pack, smoke]
+    # Two conditions, not one. `inputs` is empty on a push, so `inputs.publish` is null and a tag
+    # push builds, smokes, and stops — which is what makes tagging a release possible without
+    # shipping it. See the header for the dispatch that does publish.
+    if: startsWith(github.ref, 'refs/tags/v') && inputs.publish
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write # OIDC — trusted publishing needs this, and it is why no npm token is stored
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.14"
+          registry-url: "https://registry.npmjs.org"
+      # Trusted publishing requires npm >= 11.5.1 and the npm bundled with Node 22.14 is older, but
+      # `npm@latest` is now npm 12, whose own engines demand node ^22.22.2 — installing it on the
+      # 22.14 floor fails EBADENGINE and took a release run to discover. Pin the 11.x line: it
+      # satisfies trusted publishing and still runs on the version `engines` actually claims.
+      - run: npm install -g npm@^11.5.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball
+      - name: re-verify the hash before publishing
+        env:
+          TARBALL: ${{ needs.pack.outputs.tarball }}
+          WANT_SHA: ${{ needs.pack.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          got=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)
+          [ "$got" = "$WANT_SHA" ] || { echo "sha mismatch — refusing to publish"; exit 1; }
+      # The tarball itself, not a rebuild. `npm publish` on a source tree would re-run prepack and
+      # ship different bytes from the ones every smoke job just exercised.
+      # The dist-tag is DERIVED from the version, never hardcoded. `--tag alpha` was fine while every
+      # release was an alpha and actively wrong at the first stable one: publishing 1.0.0 under the
+      # alpha tag leaves `latest` pointing at a prerelease forever, so `npm i -g @funes-tech/cli`
+      # keeps installing the old alpha and nothing in this pipeline notices.
+      - name: publish under the dist-tag the version implies
+        env:
+          TARBALL: ${{ needs.pack.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          v=$(tar -xzOf "$TARBALL" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+          ref="${GITHUB_REF#refs/tags/}"
+          [ "v$v" = "$ref" ] || { echo "tag $ref does not match packaged version v$v — refusing to publish"; exit 1; }
+          case "$v" in
+            *-*) tag=$(echo "$v" | sed -E 's/^[^-]+-([0-9A-Za-z]+).*/\1/') ;;  # 1.2.3-alpha.4 -> alpha
+            *)   tag=latest ;;
+          esac
+          echo "publishing $v under dist-tag: $tag"
+          npm publish "$TARBALL" --tag "$tag" --provenance

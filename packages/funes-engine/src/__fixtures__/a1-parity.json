@@ -1,0 +1,136 @@
+{
+  "source": "twinkling lib/twinkling/backends/sqlite.py (_fts_query, _rrf k=60)",
+  "fts_query": [
+    {
+      "input": "fitness protein",
+      "output": "\"fitness\" OR \"protein\""
+    },
+    {
+      "input": "a",
+      "output": "\"\""
+    },
+    {
+      "input": "AI and Web3!",
+      "output": "\"AI\" OR \"and\" OR \"Web3\""
+    },
+    {
+      "input": "   ",
+      "output": "\"\""
+    },
+    {
+      "input": "TON-blockchain v2",
+      "output": "\"TON\" OR \"blockchain\" OR \"v2\""
+    },
+    {
+      "input": "Don't reindex twice",
+      "output": "\"Don\" OR \"reindex\" OR \"twice\""
+    }
+  ],
+  "rrf": [
+    {
+      "input": [
+        [
+          "a",
+          "b",
+          "c"
+        ],
+        [
+          "b",
+          "c",
+          "d"
+        ],
+        [
+          "c"
+        ]
+      ],
+      "output": [
+        "c",
+        "b",
+        "a",
+        "d"
+      ]
+    },
+    {
+      "input": [
+        [
+          "x",
+          "y"
+        ],
+        [
+          "y",
+          "x"
+        ]
+      ],
+      "output": [
+        "x",
+        "y"
+      ]
+    },
+    {
+      "input": [
+        [
+          "p",
+          "q",
+          "r"
+        ]
+      ],
+      "output": [
+        "p",
+        "q",
+        "r"
+      ]
+    },
+    {
+      "input": [
+        [],
+        [],
+        []
+      ],
+      "output": []
+    },
+    {
+      "input": [
+        [
+          "m",
+          "n",
+          "o"
+        ],
+        [],
+        [
+          "o",
+          "m"
+        ]
+      ],
+      "output": [
+        "m",
+        "o",
+        "n"
+      ]
+    },
+    {
+      "input": [
+        [
+          "1",
+          "2",
+          "3",
+          "4",
+          "5"
+        ],
+        [
+          "5",
+          "4",
+          "3",
+          "2",
+          "1"
+        ]
+      ],
+      "output": [
+        "1",
+        "5",
+        "2",
+        "4",
+        "3"
+      ]
+    }
+  ]
+}

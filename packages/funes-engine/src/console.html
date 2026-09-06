@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>funes — read-only console</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"
+        integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi"
+        crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3.33.1/dist/cytoscape.min.js"
+        integrity="sha384-lXrzMjLDk3q9l0I/kjqjMcDgfFnHvWTDeWP3DmMqoeOq49/qa8drmlP3OBWN9dQ3"
+        crossorigin="anonymous"></script>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --line:#262d38; --fg:#dbe2ea; --dim:#7d8794; --acc:#5cc8ff; --in:#b3854d; --out:#7fbf7f; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; height:100vh; display:flex; flex-direction:column; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; }
+  header b { color:var(--acc); font-weight:600; }
+  header .ro { font-size:11px; color:var(--dim); border:1px solid var(--line); border-radius:4px; padding:1px 6px; }
+  #q { flex:1; max-width:560px; background:var(--panel); border:1px solid var(--line); border-radius:6px; color:var(--fg); padding:7px 10px; font:inherit; }
+  #q:focus { outline:1px solid var(--acc); }
+  main { flex:1; display:grid; grid-template-columns: 240px 380px 1fr; min-height:0; }
+  section { overflow:auto; border-right:1px solid var(--line); padding:10px 12px; }
+  section:last-child { border-right:none; }
+  h3 { margin:4px 0 10px; font-size:11px; letter-spacing:.12em; color:var(--dim); text-transform:uppercase; }
+  .dir, .file, .hit { cursor:pointer; padding:2px 6px; border-radius:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .dir:hover, .file:hover, .hit:hover { background:var(--panel); }
+  .dir::before { content:"▸ "; color:var(--dim); }
+  .dir.open::before { content:"▾ "; }
+  .zone-incoming { color:var(--in); } .zone-output { color:var(--out); }
+  .children { margin-left:14px; }
+  .hit { padding:6px 8px; border:1px solid var(--line); border-radius:6px; margin-bottom:6px; white-space:normal; }
+  .hit .t { color:var(--acc); }
+  .hit .p { color:var(--dim); font-size:12px; }
+  .hit .s { float:right; color:var(--dim); font-size:11px; }
+  .hit .tr { float:right; font-size:10px; border:1px solid var(--line); border-radius:4px; padding:0 4px; margin-right:6px; color:var(--in); }
+  .hit .tr.trusted { color:var(--out); }
+  #page { padding:14px 22px; }
+  #page h1,#page h2,#page h3 { color:#fff; }  #page a { color:var(--acc); }
+  #page code { background:var(--panel); padding:1px 5px; border-radius:4px; }
+  #page pre { background:var(--panel); padding:10px; border-radius:8px; overflow:auto; }
+  #page blockquote { border-left:3px solid var(--line); margin-left:0; padding-left:12px; color:var(--dim); }
+  #fm { font-size:12px; color:var(--dim); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 12px; margin-bottom:14px; white-space:pre-wrap; }
+  footer { border-top:1px solid var(--line); padding:6px 16px; font-size:12px; color:var(--dim); display:flex; gap:18px; }
+  .hit .g { float:right; margin-left:6px; cursor:pointer; color:var(--dim); font-size:11px; border:1px solid var(--line); border-radius:4px; padding:0 5px; }
+  .hit .g:hover { color: var(--acc); border-color: var(--acc); }
+  #graphView { display:none; flex:1; position:relative; min-height:0; }
+  #cy { position:absolute; inset:0; }
+  #graphBar { position:absolute; top:8px; left:12px; z-index:5; display:flex; gap:8px; align-items:center; font-size:12px; color:var(--dim); background:rgba(14,17,22,.85); border:1px solid var(--line); border-radius:6px; padding:5px 10px; }
+  #graphBar button { background:none; border:1px solid var(--line); border-radius:4px; color:var(--fg); cursor:pointer; font:inherit; padding:1px 8px; }
+  #graphBar button:hover { border-color: var(--acc); color: var(--acc); }
+  .legend i { display:inline-block; width:9px; height:9px; border-radius:50%; margin:0 3px 0 8px; }
+</style>
+</head>
+<body>
+<header>
+  <b>funes</b><span class="ro">READ-ONLY CONSOLE · S3</span>
+  <input id="q" placeholder="recall — ask your second brain… (Enter)" autofocus>
+</header>
+<main>
+  <section id="treePane"><h3>Vault</h3><div id="tree"></div></section>
+  <section><h3>Recall</h3><div id="hits" class="dim">type a query ↑</div></section>
+  <section id="pagePane"><h3 id="pTitle">Page</h3><div id="fm" hidden></div><div id="page">…</div></section>
+</main>
+<div id="graphView">
+  <div id="graphBar">
+    <button id="gBack">← list</button>
+    <span id="gSeed"></span>
+    <span class="legend"><i style="background:#5cc8ff"></i>wiki <i style="background:#b3854d"></i>in_* <i style="background:#7fbf7f"></i>out_* · solid = typed edge · dashed = similarity · click = expand · dblclick = open page</span>
+  </div>
+  <div id="cy"></div>
+</div>
+<footer id="health">connecting…</footer>
+<script>
+const api = (op, args, method="POST") => fetch(
+  method === "GET" ? `/api/${op}?` + new URLSearchParams(args) : `/api/${op}`,
+  method === "GET" ? {} : { method, headers: {"content-type":"application/json"}, body: JSON.stringify(args) }
+).then(r => r.json());
+
+async function recall(query) {
+  const t0 = performance.now();
+  const r = await api("recall", { query, k: 10 });
+  const ms = Math.round(performance.now() - t0);
+  const hits = document.getElementById("hits");
+  if (!r.ok) { hits.textContent = "error: " + r.error; return; }
+  hits.innerHTML = r.result.map(h =>
+    `<div class="hit" data-p="${h.path}" data-id="${h.id}"><span class="s">${h.score.toFixed(3)}</span>` +
+    `<span class="g" data-g="${h.id}" title="explore graph">⌗</span>` +
+    `<span class="tr ${h.trust}">${h.trust}</span>` +
+    `<div class="t">${h.title}</div><div class="p">${h.path}</div></div>`).join("") ||
+    "(no results)";
+  document.getElementById("health").dataset.last = `recall ${ms}ms`;
+  refreshHealth();
+  for (const el of hits.querySelectorAll(".hit")) el.onclick = () => openPage(el.dataset.p);
+  for (const el of hits.querySelectorAll(".g")) el.onclick = (ev) => { ev.stopPropagation(); openGraph(el.dataset.g); };
+}
+
+async function openPage(path) {
+  const r = await api("page", { path });
+  if (!r.ok) { document.getElementById("page").textContent = "error: " + r.error; return; }
+  document.getElementById("pTitle").textContent = path;
+  const fmEl = document.getElementById("fm");
+  const fm = r.result.frontmatter || {};
+  fmEl.hidden = !Object.keys(fm).length;
+  fmEl.textContent = Object.entries(fm).map(([k,v]) => `${k}: ${JSON.stringify(v)}`).join("\n");
+  document.getElementById("page").innerHTML = marked.parse(r.result.body || "");
+}
+
+async function loadTree(dir, host) {
+  const r = await api("tree", dir ? { dir } : {}, "GET");
+  if (!r.ok) { host.textContent = r.error; return; }
+  host.innerHTML =
+    r.result.dirs.map(d => `<div class="dir zone-${d.zone}" data-d="${dir ? dir + "/" + d.name : d.name}">${d.name}</div><div class="children" hidden></div>`).join("") +
+    r.result.files.map(f => `<div class="file" data-p="${dir ? dir + "/" + f : f}">${f}</div>`).join("");
+  for (const el of host.querySelectorAll(":scope > .dir")) {
+    el.onclick = async () => {
+      const kids = el.nextElementSibling;
+      el.classList.toggle("open");
+      kids.hidden = !kids.hidden;
+      if (!kids.dataset.loaded) { kids.dataset.loaded = "1"; await loadTree(el.dataset.d, kids); }
+    };
+  }
+  for (const el of host.querySelectorAll(":scope > .file")) el.onclick = () => openPage(el.dataset.p);
+}
+
+async function refreshHealth() {
+  const h = await fetch("/api/health").then(r => r.json());
+  const f = document.getElementById("health");
+  f.innerHTML = `<span>${h.vault}</span><span>${h.nodes} nodes · ${h.edges} edges</span>` +
+    `<span>${h.embeddingSignature ?? "no signature"}</span>` +
+    `<span>${h.reindexDirty ? "⚠ DIRTY — run reindex" : "index clean"}</span>` +
+    `<span>${f.dataset.last ?? ""}</span>`;
+}
+
+// ── memory graph explorer (S5-UI v1): expand-on-click neighborhoods over /api/neighbors ──
+let cy = null;
+const zoneColor = id => id.startsWith("in_") ? "#b3854d" : id.startsWith("out_") ? "#7fbf7f" : "#5cc8ff";
+const trustBorder = t => t === "trusted" ? "#7fbf7f" : "#b3854d";
+
+function nodeEl(n) {
+  return { group: "nodes", data: { id: n.id, label: (n.title || n.id).slice(0, 34), trust: n.trust || "untrusted" },
+           style: { "background-color": zoneColor(n.id), "border-color": trustBorder(n.trust) } };
+}
+
+async function expandNode(id) {
+  const r = await api("neighbors", { id, k: 8 });
+  if (!r.ok || !r.result.node) return;
+  const { node, similar, edgesOut, edgesIn } = r.result;
+  const els = [nodeEl(node)];
+  for (const s of similar) {
+    els.push(nodeEl(s));
+    els.push({ group: "edges", data: { id: `sim:${[id, s.id].sort().join("|")}`, source: id, target: s.id, label: s.score.toFixed(2) },
+               classes: "sim" });
+  }
+  for (const e of edgesOut) {
+    els.push(nodeEl({ id: e.id, title: e.title || e.id, trust: e.trust }));
+    els.push({ group: "edges", data: { id: `t:${id}>${e.id}:${e.type}`, source: id, target: e.id, label: e.type }, classes: "typed" });
+  }
+  for (const e of edgesIn) {
+    els.push(nodeEl({ id: e.id, title: e.title || e.id, trust: e.trust }));
+    els.push({ group: "edges", data: { id: `t:${e.id}>${id}:${e.type}`, source: e.id, target: id, label: e.type }, classes: "typed" });
+  }
+  for (const el of els) {
+    if (el.group === "nodes" ? cy.getElementById(el.data.id).length === 0 : cy.getElementById(el.data.id).length === 0) cy.add(el);
+  }
+  cy.getElementById(id).addClass("expanded");
+  cy.layout({ name: "cose", animate: "end", animationDuration: 400, nodeRepulsion: 9000, idealEdgeLength: 110, fit: true, padding: 40 }).run();
+}
+
+async function openGraph(seedId) {
+  document.querySelector("main").style.display = "none";
+  document.getElementById("graphView").style.display = "block";
+  document.getElementById("gSeed").textContent = seedId;
+  if (!cy) {
+    cy = cytoscape({
+      container: document.getElementById("cy"),
+      style: [
+        { selector: "node", style: { label: "data(label)", color: "#dbe2ea", "font-size": 9, "text-wrap": "ellipsis", "text-max-width": 130,
+          width: 16, height: 16, "border-width": 2, "text-valign": "bottom", "text-margin-y": 4 } },
+        { selector: "node.expanded", style: { width: 24, height: 24 } },
+        { selector: "edge", style: { width: 1, "curve-style": "bezier", label: "data(label)", "font-size": 7, color: "#7d8794",
+          "line-color": "#262d38", "target-arrow-shape": "none" } },
+        { selector: "edge.sim", style: { "line-style": "dashed" } },
+        { selector: "edge.typed", style: { "line-color": "#5cc8ff", width: 1.6, "target-arrow-shape": "triangle", "arrow-scale": 0.7, "target-arrow-color": "#5cc8ff" } },
+      ],
+      wheelSensitivity: 0.25,
+    });
+    cy.on("tap", "node", (ev) => expandNode(ev.target.id()));
+    cy.on("dbltap", "node", (ev) => {
+      const id = ev.target.id();
+      closeGraph();
+      openPage(id.endsWith(".md") ? id : id + ".md");
+    });
+  } else {
+    cy.elements().remove();
+  }
+  await expandNode(seedId);
+}
+
+function closeGraph() {
+  document.getElementById("graphView").style.display = "none";
+  document.querySelector("main").style.display = "grid";
+}
+document.getElementById("gBack").onclick = closeGraph;
+
+document.getElementById("q").addEventListener("keydown", e => {
+  if (e.key === "Enter" && e.target.value.trim()) recall(e.target.value.trim());
+});
+loadTree("", document.getElementById("tree"));
+refreshHealth();
+</script>
+</body>
+</html>
