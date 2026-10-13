@@ -1,0 +1,113 @@
+# P3.17 — CI for outsiders. Four independent gates so a failure names its own cause:
+#   test     — lint:core (H7 edge-portability) + lint:dag (P3.14 acyclicity) + the suite
+#   postgres — the LIVE profile-B smoke test, which skips locally without FUNES_PG_URL and so had
+#              no standing coverage since PGLite was removed (2026-07-20). A pgvector service
+#              container gives it a real cluster on every push.
+#   embedding-conformance — PLAN-0.3.0 P0.2: the linux-x64 vector byte-equals its own golden. A
+#              merge gate since the 0.4.0 wave (PLAN-0.4.0 item 13); a measurement before it.
+#   secrets  — gitleaks over the full history (the repo is public)
+name: ci
+
+# Pinned to match release.yml's BUN_VERSION. `latest` here meant CI validated the suite on a runtime
+# the released artifact was never built with — the two gates could disagree and neither would say so.
+# These two numbers move together or not at all.
+env:
+  BUN_VERSION: "1.4.2"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      # E5 embedder + real cross-encoder tests are excluded by the `test` script's name filter:
+      # they download models from HF. The one model-downloading gate is embedding-conformance below.
+      - run: bun run test
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - name: postgres smoke (profile B)
+        env:
+          FUNES_PG_URL: postgres://postgres@localhost:5432/postgres
+        run: bun test packages/funes-engine/src/postgres-smoke.test.ts
+
+  # PLAN-0.3.0 P0.2 — "equal effective embedding signatures imply byte-identical vectors."
+  # RAI-152 measured linux/x64 against the darwin/arm64 golden: one signature, two vectors. So
+  # PLAN-0.4.0 item 3 took the extend branch — the signature names the platform, arch and
+  # onnxruntime version — and each platform gates against its OWN golden,
+  # __fixtures__/embedding-conformance.<platform>-<arch>.json; this job is the linux-x64 one.
+  #
+  # A merge gate since the wave (item 13): no workflow_dispatch-only `if`, no continue-on-error. A
+  # missing golden FAILS BY NAME — the wave branch's first dispatch goes red naming
+  # embedding-conformance.linux-x64.json and uploads the record below, which is committed under
+  # that exact name before the branch is re-dispatched; only a green run may reach `main`. The
+  # 135MB download on every run is the price of the gate, paid once per cache key.
+  embedding-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      # 135MB of revision-pinned weights, ~70s cold. Keyed on the file carrying the pin, so a
+      # re-pin misses and re-downloads. An unrelated edit to that file also misses — it is a cache,
+      # never a correctness input: the pin itself is what makes the weights identical.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.twinkling/models
+          key: e5-weights-${{ hashFiles('packages/funes-engine/src/embedder.ts') }}
+          restore-keys: e5-weights-
+      # Named explicitly because `bun run test` filters it out by name (it downloads the model).
+      - name: conformance — linux-x64 against its own golden
+        env:
+          # Named as the golden it becomes: a first run's record is committed verbatim.
+          FUNES_CONFORMANCE_OUT: ${{ runner.temp }}/embedding-conformance.linux-x64.json
+        run: bun test packages/funes-engine/src/embedding-conformance.test.ts
+      # always(): a FAILING run is the interesting one — its record is the missing golden or the
+      # vector that disagreed, and without the upload it is gone.
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedding-conformance-linux
+          path: ${{ runner.temp }}/embedding-conformance.linux-x64.json
+          # The record is written after the forward pass, so a crash during download or inference
+          # produces no file. Default `warn` would upload nothing and still succeed, making "ran and
+          # disagreed" indistinguishable from "never ran".
+          if-no-files-found: error
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks scans history, not just the tip
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
