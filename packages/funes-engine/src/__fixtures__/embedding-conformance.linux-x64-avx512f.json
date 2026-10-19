@@ -1,0 +1,18 @@
+{
+  "text": "funes conformance fixture: цели по фитнесу, protein, 42.",
+  "signature": "Xenova/multilingual-e5-small:384:rev=761b726dd34fb83930e26aab4e9ac3899aa1fa78:dt=q8:pool=mean:trunc=2000:fwd=1:plat=linux:arch=x64:isa=avx512f:ort=1.30.0",
+  "dim": 384,
+  "sha256": "6cc9dd42bef691218ea2213a913c08893a42f0ec046d2c5eabb515b810381aa7",
+  "vector": "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",
+  "recordedOn": {
+    "platform": "linux/x64",
+    "isa": "avx512f",
+    "flags": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology tsc_reliable nonstop_tsc cpuid extd_apicid aperfmperf tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext vmmcall fsgsbase bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves user_shstk avx_vnni avx512_bf16 clzero xsaveerptr rdpru arat npt nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold v_vmsave_vmload avx512vbmi umip avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid fsrm avx512_vp2intersect",
+    "cpu": "AMD EPYC 9V45 96-Core Processor",
+    "bun": "1.4.2",
+    "onnxruntime": {
+      "common": "1.30.0",
+      "node": "1.30.0"
+    }
+  }
+}

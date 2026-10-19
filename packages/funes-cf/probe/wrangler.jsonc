@@ -1,0 +1,18 @@
+// funes-probe: the throwaway that runs record 35 E7 (PLAN-0.5.0 item 36). scripts/cf-session.sh's
+// `probe` act deploys it, pipes it a per-session random bearer as PROBE_BEARER, calls it once, and
+// deletes it and its bucket before the logout. test/config.node.ts guards every line below.
+// Never `wrangler dev --remote` (record 31): there is no local `ai` binding, so this deployed
+// throwaway is the only binding path to Workers AI.
+{
+  "name": "funes-probe",
+  "main": "index.ts",
+  // workerd 1.20261006.1, the one wrangler 4.149.0 ships (record 36).
+  "compatibility_date": "2026-10-06",
+  // The throwaway spike bucket, never the canonical one. cf-session.sh names it as PROBE_BUCKET.
+  "r2_buckets": [{ "binding": "SPIKE", "bucket_name": "funes-probe-spike" }],
+  // Workers AI with no gateway: the Worker passes no options to AI.run.
+  "ai": { "binding": "AI" },
+  // No route of its own: the act reaches it on workers.dev, behind the bearer.
+  "workers_dev": true,
+  "observability": { "logs": { "enabled": false, "invocation_logs": false }, "traces": { "enabled": false } }
+}

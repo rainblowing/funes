@@ -1,0 +1,158 @@
+# P3.17 — CI for outsiders. Independent gates so a failure names its own cause:
+#   test     — lint:core (H7 edge-portability) + lint:dag (P3.14 acyclicity) + the suite
+#   funes-cf — the edge Worker's tests under local workerd (PLAN-0.5.0 item 33)
+#   postgres — the LIVE profile-B smoke test, which skips locally without FUNES_PG_URL and so had
+#              no standing coverage since PGLite was removed (2026-07-20). A pgvector service
+#              container gives it a real cluster on every push.
+#   embedding-conformance — PLAN-0.3.0 P0.2: the linux-x64 vector byte-equals the golden of the
+#              runner's instruction-set class (RAI-289). A merge gate since the 0.4.0 wave
+#              (PLAN-0.4.0 item 13); a measurement before it.
+#   secrets  — gitleaks over the full history (the repo is public)
+name: ci
+
+# Pinned to match release.yml's BUN_VERSION. `latest` here meant CI validated the suite on a runtime
+# the released artifact was never built with — the two gates could disagree and neither would say so.
+# These two numbers move together or not at all.
+env:
+  BUN_VERSION: "1.4.3"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      conformance_runs:
+        # RAI-289: GitHub's x64 pool mixes EPYC 7763 (avx2) and EPYC 9V45 (avx512f) runners, and a
+        # job cannot pick one. N parallel conformance jobs give N draws, so one dispatch can collect
+        # both classes' records. Push and pull_request runs have no inputs: one job.
+        description: "embedding-conformance jobs to run in parallel (one CPU draw each)"
+        type: choice
+        options: ["1", "2", "4", "6", "8"]
+        default: "1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      # E5 embedder + real cross-encoder tests are excluded by the `test` script's name filter:
+      # they download models from HF. The one model-downloading gate is embedding-conformance below.
+      - run: bun run test
+
+  # PLAN-0.5.0 item 33 — funes-cf (the Worker funes-taste) under local workerd, through
+  # @cloudflare/vitest-plugin. Node runs vitest and wrangler (wrangler 4.149.0's engines: >=22), at
+  # 22.14 as release.yml pins it; bun only installs. The config tests guard the wrangler config's
+  # invariants; the test config has no `ai` binding, and env.AI and OpenRouter are fakes, so the job
+  # touches no Cloudflare account and no network beyond the install.
+  funes-cf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.14"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - run: npm test
+        working-directory: packages/funes-cf
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - name: postgres smoke (profile B)
+        env:
+          FUNES_PG_URL: postgres://postgres@localhost:5432/postgres
+        run: bun test packages/funes-engine/src/postgres-smoke.test.ts
+
+  # PLAN-0.3.0 P0.2 — "equal effective embedding signatures imply byte-identical vectors."
+  # RAI-152 measured linux/x64 against the darwin/arm64 golden: one signature, two vectors. So
+  # PLAN-0.4.0 item 3 took the extend branch — the signature names the platform, arch and
+  # onnxruntime version — and each platform gates against its OWN golden. RAI-289 then measured an
+  # EPYC 7763 (Zen 3) and an EPYC 9V45 (Zen 5) runner: one signature, two vectors, because MLAS
+  # swaps its fp32 kernels to AVX-512F where it can. So on linux-x64 the signature also names the
+  # instruction-set class, and the golden is per class:
+  # __fixtures__/embedding-conformance.<platform>-<arch>[-<isa>].json — this job is linux-x64, and
+  # it gates against embedding-conformance.linux-x64-<the runner's class>.json.
+  #
+  # A merge gate since the wave (item 13): no workflow_dispatch-only `if`, no continue-on-error. A
+  # missing golden FAILS BY NAME — a runner whose class has no golden (avx512f until one is
+  # recorded) goes red naming it and uploads its record below, which is committed under that exact
+  # name; only a green run may reach `main`. Which class a run draws is the pool's choice, so the
+  # gate is the avx2 golden on the exact commit plus both class goldens recorded once by the code
+  # that signs `isa=` (PLAN-0.5.0 item 3, amended 2026-10-12) — not "green on both CPUs", a lottery.
+  # A dispatch with `conformance_runs` > 1 draws several runners at once to collect the missing
+  # class. The 135MB download on every run is the price of the gate, paid once per cache key.
+  embedding-conformance:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # every draw reports its own CPU class and record
+      matrix:
+        run: ${{ fromJSON('{"1":[1],"2":[1,2],"4":[1,2,3,4],"6":[1,2,3,4,5,6],"8":[1,2,3,4,5,6,7,8]}')[inputs.conformance_runs || '1'] }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      # 135MB of revision-pinned weights, ~70s cold. Keyed on the file carrying the pin, so a
+      # re-pin misses and re-downloads. An unrelated edit to that file also misses — it is a cache,
+      # never a correctness input: the pin itself is what makes the weights identical.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.funes/models
+          key: e5-weights-${{ hashFiles('packages/funes-engine/src/embedder.ts') }}
+          restore-keys: e5-weights-
+      # Named explicitly because `bun run test` filters it out by name (it downloads the model).
+      - name: conformance — linux-x64 against its own class's golden
+        env:
+          # A directory: the test writes its record there under the golden's own name
+          # (embedding-conformance.linux-x64-<isa>.json), so it is committed verbatim, and the
+          # class is legible from the file name inside the artifact.
+          FUNES_CONFORMANCE_OUT: ${{ runner.temp }}/conformance/
+        run: bun test packages/funes-engine/src/embedding-conformance.test.ts
+      # always(): a FAILING run is the interesting one — its record is the missing golden or the
+      # vector that disagreed, and without the upload it is gone.
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # One artifact per matrix leg: two legs on different CPU classes (or the same) never
+          # overwrite each other's record.
+          name: embedding-conformance-linux-${{ matrix.run }}
+          path: ${{ runner.temp }}/conformance/
+          # The record is written after the forward pass, so a crash during download or inference
+          # produces no file. Default `warn` would upload nothing and still succeed, making "ran and
+          # disagreed" indistinguishable from "never ran".
+          if-no-files-found: error
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks scans history, not just the tip
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

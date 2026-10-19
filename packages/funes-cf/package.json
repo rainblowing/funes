@@ -1,0 +1,27 @@
+{
+  "name": "funes-cf",
+  "private": true,
+  "description": "The edge writer: the Cloudflare Worker funes-taste (the taste DO, its R2 bucket, Workers AI). Deployed from this repo, never published (PLAN-0.5.0 item 33, ADR-0011).",
+  "type": "module",
+  "scripts": {
+    "test": "tsc --noEmit -p . && vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.3.1",
+    "funes-core": "workspace:*",
+    "funes-shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.4.0",
+    "@cloudflare/workers-types": "5.20261010.1",
+    "@modelcontextprotocol/client": "^2.3.1",
+    "@types/node": "25.9.2",
+    "@vitest/runner": "4.1.11",
+    "@vitest/snapshot": "4.1.11",
+    "funes-engine": "workspace:*",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.149.0",
+    "yaml": "^2.9.1"
+  }
+}

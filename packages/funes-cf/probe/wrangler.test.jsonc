@@ -1,0 +1,14 @@
+// The probe's TEST config: probe/wrangler.jsonc less the `ai` binding (test/config.node.ts holds it
+// to exactly that). Never deployed. env.AI in tests is vitest.config.ts's DriftingAi.
+{
+  "name": "funes-probe",
+  "main": "index.ts",
+  // workerd 1.20261006.1, the one wrangler 4.149.0 ships (record 36).
+  "compatibility_date": "2026-10-06",
+  // The throwaway spike bucket, never the canonical one. cf-session.sh names it as PROBE_BUCKET.
+  "r2_buckets": [{ "binding": "SPIKE", "bucket_name": "funes-probe-spike" }],
+  // No `ai` binding: Workers AI has no local mode.
+  // No route of its own: the act reaches it on workers.dev, behind the bearer.
+  "workers_dev": true,
+  "observability": { "logs": { "enabled": false, "invocation_logs": false }, "traces": { "enabled": false } }
+}

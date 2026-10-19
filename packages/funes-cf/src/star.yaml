@@ -1,0 +1,53 @@
+# star manifest — taste: Vlad's taste items, one OKF page per item (RAI-175, record 25).
+# Bundled with funes-taste's DO as a Text module (wrangler.jsonc `rules`); the DO parses it at instance
+# start, refuses to serve on a parse or validation failure, and publishes R2's copy (ADR-0011
+# "Star configuration"). A change here is a non-gradual deploy. test/star-yaml.node.ts guards it.
+# No write_authority (a B-cell annotation funes does not read), no memory.substrate (the edge index is
+# ADR-0015's DO SQLite twin) and no memory.embedder (the code a locus deploys selects its embedder).
+
+version: 3
+
+meta:
+  id: mcp://rainblow.ing/taste
+  name: taste
+  locus: edge
+  exposure: user-facing
+  write_locus: funes-taste          # the DO's locus: the Worker's script name (RAI-173), FUNES_LOCUS
+  constellation: rainblowing
+
+memory:
+  okf: "0.2"
+  memoryDir: items                  # every item page is items/<domain>/<title>[--<creator|year>].md
+  recall:                           # ADR-0013 (filters), ADR-0015 (serve, collapse); funes code names no taste key
+    keys:                           # record 25 Handed on (RAI-178), plus the titles for an exact lookup
+      - domain
+      - type
+      - taste_status
+      - suggested
+      - suggestion_rank
+      - my_score
+      - my_score_proxy
+      - public_score
+      - public_score_source
+      - year
+      - title
+      - title_ru
+    values:
+      domain: [books, movies, games, music, youtube]
+      type: [Book, Film, TV Series, Video Game, Music Album, Music Artist, YouTube Video, YouTube Channel]
+    predicates:
+      # taste(page): an item page that is not suggested, or is scored (RAI-175).
+      taste:
+        - { suggested: { ne: true }, domain: { exists: true } }
+        - { my_score: { exists: true } }
+      # The suggestions not yet acted on. The optional `taste_status: todo` clause is not taken
+      # (PLAN-0.5.0 "Not yet specified").
+      suggestion:
+        - { suggested: true, my_score: { exists: false } }
+    serve: [domain, taste_status, suggested, my_score, my_score_proxy, plays, type, creator, year]
+    collapse: [type, creator]
+
+trifecta:
+  preset: user-facing               # must equal meta.exposure
+  session_taint:
+    auto_downgrade: true

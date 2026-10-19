@@ -1,0 +1,33 @@
+// The TEST config: vitest.config.ts runs the Worker under local workerd with it. It is
+// wrangler.jsonc less the `ai` binding, and test/config.node.ts holds it to exactly that, so an
+// edit to one is an edit to both. Never deployed. env.AI in tests is vitest.config.ts's fake.
+{
+  "name": "funes-taste",
+  "main": "src/index.ts",
+  // workerd 1.20261006.1, the one wrangler 4.149.0 ships (record 36).
+  "compatibility_date": "2026-10-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    // Must equal `name`: the DO serves only when it equals the bundled star.yaml's write_locus.
+    "FUNES_LOCUS": "funes-taste",
+    // Placeholders. Vlad names the host on one of his zones at provisioning (runbook); `.invalid`
+    // cannot route, so a deploy before that fails.
+    "FUNES_HOST": "funes-taste.invalid",
+    "TELEGRAM_ALLOWED_IDS": ""
+  },
+  // The one SQLite DO namespace (RAI-190). The binding names no script_name.
+  "durable_objects": { "bindings": [{ "name": "TASTE", "class_name": "TasteDO" }] },
+  // Without new_sqlite_classes the class is KV-backed for good: no SQL, no transactionSync.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TasteDO"] }],
+  // The canonical bucket. Only the DO's module names this binding. No remote, no
+  // preview_bucket_name, no previews block: a Preview bound to it would be a second writer.
+  "r2_buckets": [{ "binding": "TASTE_VAULT", "bucket_name": "funes-taste-vault" }],
+  // No `ai` binding: Workers AI has no local mode (test/config.node.ts asserts this file is the deploy config less `ai`).
+  // FUNES_HOST is a custom domain (record 34); the entry answers 421 to any other host.
+  "routes": [{ "pattern": "funes-taste.invalid", "custom_domain": true }],
+  "workers_dev": false,
+  // The taste star.yaml is bundled as text (item 34).
+  "rules": [{ "type": "Text", "globs": ["**/*.yaml"], "fallthrough": true }],
+  // Invocation logs would record /mint's query string.
+  "observability": { "logs": { "enabled": false, "invocation_logs": false }, "traces": { "enabled": false } }
+}

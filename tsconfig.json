@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "lib": ["ESNext"],
+    "types": ["bun"],
+    "module": "ESNext",
+    "target": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  // docs/research holds research prototypes, each with its own package.json and dependencies.
+  // packages/funes-cf is a Worker: workers-types, not bun's; it typechecks with its own tsconfig.
+  "exclude": ["node_modules", "docs/research", "packages/funes-cf"]
+}
