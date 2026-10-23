@@ -1,0 +1,24 @@
+{
+  "name": "funes-core",
+  "version": "0.6.1",
+  "description": "The funes kernel (ADR-0022): the code every host runs identically — the page codec, FunesStore over ports, the op registry and dispatch, the scope guard, ranking, the write rule and authorize. Imports only the lint:core allowlist; Node specifics live in funes-engine, Cloudflare specifics in funes-cf.",
+  "type": "module",
+  "sideEffects": false,
+  "module": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./mcp-http": "./src/mcp-http.ts",
+    "./internal": "./src/internal.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.3.1",
+    "picomatch": "4.0.7",
+    "yaml": "2.9.1",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/picomatch": "^4.0.3"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,101 @@
+{
+  "spec": "star identity grammar — <access>://<constellation-domain>/<workname>[/<subname>…][?<params>]",
+  "note": [
+    "THE CROSS-REPO CONTRACT. funes owns the parser; the harness consumes it and runs THIS FILE in",
+    "its own suite. The two suites must agree byte for byte, so any grammar change lands here first",
+    "and both repos see it.",
+    "",
+    "Every domain here is an RFC 2606 reserved name. This file ships in the public projection, so it",
+    "encodes the GRAMMAR and never a real estate: no real constellation, no real star, no real host.",
+    "Deployment-specific conformance belongs in the private harness suite."
+  ],
+
+  "accepted": [
+    { "uri": "dropbox://example.org/notes", "key": "example.org/notes", "access": "dropbox", "path": ["notes"] },
+    { "uri": "git://example.org/engine", "key": "example.org/engine", "access": "git", "path": ["engine"],
+      "why": "the identity is a NAME; the actual remote lives in the star's access map" },
+    { "uri": "mcp://example.org/engine", "key": "example.org/engine", "access": "mcp", "path": ["engine"],
+      "why": "SAME KEY as the git form above — access is not identity" },
+    { "uri": "file://example.org/scratch", "key": "example.org/scratch", "access": "file", "path": ["scratch"] },
+    { "uri": "git://example.net/atlas", "key": "example.net/atlas", "access": "git", "path": ["atlas"] },
+    { "uri": "dropbox://sub.example.com/ledger", "key": "sub.example.com/ledger", "access": "dropbox", "path": ["ledger"],
+      "why": "a multi-label domain is fine" },
+    { "uri": "git://example.org/tool.kit", "key": "example.org/tool.kit", "access": "git", "path": ["tool.kit"],
+      "why": "a dot inside a segment is legal — the workname really can contain one" },
+    { "uri": "git://example.org/atlas/inventory", "key": "example.org/atlas/inventory", "access": "git",
+      "path": ["atlas", "inventory"], "why": "depth 2 — main name, then secondary name" },
+    { "uri": "git://example.org/a/b/c/d", "key": "example.org/a/b/c/d", "access": "git", "path": ["a", "b", "c", "d"],
+      "why": "depth 4 — the maximum, accepted" },
+    { "uri": "mcp://example.org/engine?rev=2", "key": "example.org/engine", "access": "mcp", "path": ["engine"], "params": "rev=2",
+      "why": "params are preserved on the parse and excluded from the key" },
+    { "uri": "GIT://Example.ORG/engine", "key": "example.org/engine", "access": "git", "path": ["engine"],
+      "why": "normalization step 1 — the scheme and the domain lowercase; the path does not" },
+    { "uri": "git://example.org/engine/", "key": "example.org/engine", "access": "git", "path": ["engine"],
+      "why": "normalization step 3 — one trailing slash is dropped" },
+    { "uri": "  git://example.org/engine  ", "key": "example.org/engine", "access": "git", "path": ["engine"],
+      "why": "surrounding whitespace is trimmed" }
+  ],
+
+  "canonicalKeys": [
+    { "in": "example.org/notes", "key": "example.org/notes" },
+    { "in": "example.org/atlas/inventory", "key": "example.org/atlas/inventory" },
+    { "in": "Example.ORG/engine", "key": "example.org/engine", "why": "the domain lowercases here too" },
+    { "in": "example.org/engine/", "key": "example.org/engine", "why": "one trailing slash is dropped" },
+    { "in": "git://example.org/engine", "key": null, "why": "a full URI is NOT a bare key — parseStarUri owns that form" },
+    { "in": "example/engine", "key": null, "why": "bad-domain: a bare hostname is not a constellation domain" },
+    { "in": "example.org", "key": null, "why": "no-workname" },
+    { "in": "example.org/Engine", "key": null, "why": "bad-segment: uppercase" },
+    { "in": "example.org/a/b/c/d/e", "key": null, "why": "too-deep" },
+    { "in": "example.org/engine?rev=2", "key": null, "why": "a key carries no parameters" },
+    { "in": "not-a-ref", "key": null },
+    { "in": "", "key": null }
+  ],
+
+  "sameStar": [
+    { "a": "git://example.org/engine", "b": "example.org/engine", "equal": true,
+      "why": "the two accepted forms of one identity — this is what a --stars flag must honor" },
+    { "a": "git://example.org/engine", "b": "mcp://example.org/engine", "equal": true,
+      "why": "the transport changed; the star did not" },
+    { "a": "git://example.org/engine", "b": "git://example.org/engine?rev=9", "equal": true },
+    { "a": "GIT://Example.ORG/engine", "b": "git://example.org/engine/", "equal": true },
+    { "a": "git://example.org/engine", "b": "git://example.net/engine", "equal": false,
+      "why": "same workname, different constellation — two stars" },
+    { "a": "git://example.org/engine", "b": "https://code.example.com/org/engine", "equal": false,
+      "why": "an unparsable side is never equal to anything" },
+    { "a": "not-a-ref", "b": "not-a-ref", "equal": false,
+      "why": "two unparsable refs must not match each other either" }
+  ],
+
+  "rejected": [
+    { "uri": "ssh://user@host.example:2222/git/engine.git", "reason": "has-userinfo",
+      "why": "the shape a pre-grammar identity often had — userinfo, a port, and a host that is not a constellation" },
+    { "uri": "https://code.example.com/org/engine", "reason": "unknown-access",
+      "why": "a code-host URL — https is not in the access vocabulary" },
+    { "uri": "not-a-ref", "reason": "not-a-uri", "why": "the placeholder some registries still carry" },
+    { "uri": "example.org/engine", "reason": "not-a-uri",
+      "why": "a bare canonical key is NOT a URI; parseCanonicalKey accepts it as a separate form" },
+    { "uri": "git:/example.org/engine", "reason": "not-a-uri", "why": "one slash" },
+    { "uri": "git://example.org/engine#head", "reason": "has-fragment", "why": "a star has no sub-resource" },
+    { "uri": "dropbox://example.org:443/notes", "reason": "has-port", "why": "an identity is not an address" },
+    { "uri": "git://user@example.org/engine", "reason": "has-userinfo", "why": "credentials never live in an identity" },
+    { "uri": "git://example/engine", "reason": "bad-domain", "why": "a bare hostname is not a constellation domain" },
+    { "uri": "git:///engine", "reason": "bad-domain", "why": "empty authority" },
+    { "uri": "git://example.org", "reason": "no-workname" },
+    { "uri": "git://example.org/", "reason": "no-workname" },
+    { "uri": "git://example.org/Engine", "reason": "bad-segment",
+      "why": "uppercase fails closed — case collides on a case-insensitive filesystem" },
+    { "uri": "git://example.org/a//b", "reason": "bad-segment", "why": "empty segment" },
+    { "uri": "git://example.org/../etc", "reason": "bad-segment", "why": "traversal" },
+    { "uri": "git://example.org/./engine", "reason": "bad-segment" },
+    { "uri": "git://example.org/eng ine", "reason": "bad-segment", "why": "space" },
+    { "uri": "git://example.org/eng%20ine", "reason": "bad-segment", "why": "percent-encoding is outside the grammar" },
+    { "uri": "git://example.org/a/b/c/d/e", "reason": "too-deep", "why": "five segments; the cap is four" }
+  ],
+
+  "legalButRetired": [
+    { "uri": "dropbox://example.org/vault/notes", "key": "example.org/vault/notes",
+      "why": "PARSES FINE. A sync-root segment like `vault` is a legal segment, so the parser cannot and must not reject it. A deployment retires the form because the main name is a storage root and not a name." },
+    { "uri": "dropbox://example.org/vault/other-constellation/ledger", "key": "example.org/vault/other-constellation/ledger",
+      "why": "PARSES FINE at depth 3. What is wrong here is POLICY, not grammar: the domain names a constellation that does not own the star. A manifest handshake catches that; the parser has no manifest and must not pretend to." }
+  ]
+}
