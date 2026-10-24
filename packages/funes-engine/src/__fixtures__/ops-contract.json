@@ -1,0 +1,683 @@
+{
+  "_comment": "FROZEN advertised-contract snapshot. Regenerating this file IS a contract change to every MCP client and to twinkling — do it in its own commit whose diff is the release note. Regenerate with `bun run scripts/freeze-ops-contract.ts`.",
+  "operations": [
+    {
+      "name": "recall",
+      "readonly": true,
+      "crossStar": true,
+      "scopeGuarded": true,
+      "tiers": [
+        "home",
+        "org",
+        "edge"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "free-text question"
+          },
+          "k": {
+            "type": "number",
+            "description": "max results (default 5)"
+          },
+          "where": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "exists": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "exists"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "ne": {
+                      "type": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "ne"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "description": "filter on keys or predicates the star declares (memory.recall): a scalar (strict equality), {exists: bool} or {ne: scalar}; a predicate takes true or false"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "contentGeneration": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plan": {
+            "type": "object",
+            "properties": {
+              "arms": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "where": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              },
+              "collapse": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "arms",
+              "where",
+              "collapse"
+            ],
+            "additionalProperties": false
+          },
+          "vaultChangedSinceReindex": {
+            "type": "boolean",
+            "const": true
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "rank": {
+                  "type": "number"
+                },
+                "score": {
+                  "type": "number"
+                },
+                "trust": {
+                  "type": "string",
+                  "enum": [
+                    "trusted",
+                    "untrusted",
+                    "derived"
+                  ]
+                },
+                "volatile": {
+                  "type": "boolean",
+                  "const": true
+                },
+                "freshness": {
+                  "type": "string"
+                },
+                "duplicates": {
+                  "type": "number"
+                },
+                "fields": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {
+                    "type": [
+                      "string",
+                      "number",
+                      "boolean"
+                    ]
+                  }
+                }
+              },
+              "required": [
+                "id",
+                "title",
+                "path",
+                "rank",
+                "score",
+                "trust"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "contentGeneration",
+          "results"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "page",
+      "readonly": true,
+      "crossStar": false,
+      "scopeGuarded": false,
+      "tiers": [
+        "home",
+        "org",
+        "edge"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "vault-relative path, e.g. yachts/research.md"
+          },
+          "raw": {
+            "type": "boolean",
+            "description": "true = also answer the exact bytes as `content`"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "indexed_page",
+      "readonly": true,
+      "crossStar": true,
+      "scopeGuarded": true,
+      "tiers": [
+        "home",
+        "org",
+        "edge"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "node id (vault-relative path without .md)"
+          },
+          "path": {
+            "type": "string",
+            "description": "vault-relative path (with or without .md)"
+          }
+        }
+      }
+    },
+    {
+      "name": "health",
+      "readonly": true,
+      "crossStar": true,
+      "scopeGuarded": false,
+      "tiers": [
+        "home",
+        "org",
+        "edge"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "result": {
+        "type": "object",
+        "properties": {
+          "nodes": {
+            "type": "number"
+          },
+          "edges": {
+            "type": "number"
+          },
+          "embeddingSignature": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "servingSignature": {
+            "type": "string"
+          },
+          "contentGeneration": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lastReindexAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reindexDirty": {
+            "type": "boolean"
+          },
+          "ignoreScope": {
+            "type": "boolean"
+          },
+          "scopeMatches": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "vaultChangedSinceReindex": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "freshnessBasis": {
+            "type": "string",
+            "enum": [
+              "stat",
+              "none",
+              "unreadable",
+              "scope"
+            ]
+          },
+          "locus": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "vault": {
+            "type": "string"
+          },
+          "proposalProtocol": {
+            "type": "number"
+          },
+          "starId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "applyState": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "building",
+              "idle"
+            ]
+          },
+          "indexDirty": {
+            "type": "number"
+          },
+          "conflicts": {
+            "type": "number"
+          },
+          "okf": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "nonconformant": {
+                    "type": "number"
+                  },
+                  "malformed": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "nonconformant",
+                  "malformed"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "exportDirty": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "nodes",
+          "edges",
+          "embeddingSignature",
+          "servingSignature",
+          "contentGeneration",
+          "lastReindexAt",
+          "reindexDirty",
+          "ignoreScope",
+          "scopeMatches",
+          "vaultChangedSinceReindex",
+          "freshnessBasis",
+          "locus"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "tree",
+      "readonly": true,
+      "crossStar": false,
+      "scopeGuarded": false,
+      "tiers": [
+        "home"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dir": {
+            "type": "string",
+            "description": "vault-relative folder (default: vault root)"
+          }
+        }
+      }
+    },
+    {
+      "name": "neighbors",
+      "readonly": true,
+      "crossStar": false,
+      "scopeGuarded": true,
+      "tiers": [
+        "home"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "node id (vault-relative path without .md)"
+          },
+          "k": {
+            "type": "number",
+            "description": "nearest neighbors to return (default 8, max 25)"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "graph",
+      "readonly": true,
+      "crossStar": false,
+      "scopeGuarded": true,
+      "tiers": [
+        "home"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "hotlist",
+      "readonly": true,
+      "crossStar": true,
+      "scopeGuarded": true,
+      "tiers": [
+        "home"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "n": {
+            "type": "number",
+            "description": "max rows (default 20, max 100)"
+          }
+        }
+      }
+    },
+    {
+      "name": "remember",
+      "readonly": false,
+      "crossStar": false,
+      "scopeGuarded": false,
+      "tiers": [
+        "home",
+        "org"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 1000,
+            "description": "short title"
+          },
+          "body": {
+            "type": "string",
+            "maxLength": 100000,
+            "description": "the memory content (markdown); split a longer record into successive memories"
+          },
+          "type": {
+            "type": "string",
+            "description": "optional item type (default: memory)"
+          },
+          "tags": {
+            "type": "string",
+            "description": "optional comma-separated tags"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "optional provenance: the pages or URIs this item comes from, e.g. [[wiki/x]]"
+          },
+          "volatile": {
+            "type": "boolean",
+            "description": "true if this is a STATE that goes stale and should be replaced by a later write (a rate, a plan); false/omitted for an EVENT, which is append-only. Recorded and returned by recall; supersession is still an explicit act, not automatic"
+          },
+          "as_of": {
+            "type": "string",
+            "description": "when this was true (ISO date), if that differs from when it was written"
+          }
+        },
+        "required": [
+          "title",
+          "body"
+        ]
+      }
+    },
+    {
+      "name": "supersede",
+      "readonly": false,
+      "crossStar": false,
+      "scopeGuarded": false,
+      "tiers": [
+        "home",
+        "org"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "oldId": {
+            "type": "string",
+            "description": "id of the item to supersede (out_memory/...)"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 1000
+          },
+          "body": {
+            "type": "string",
+            "maxLength": 100000
+          },
+          "type": {
+            "type": "string",
+            "description": "optional item type (default: memory)"
+          },
+          "tags": {
+            "type": "string",
+            "description": "optional comma-separated tags"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "optional provenance: the pages or URIs this item comes from, e.g. [[wiki/x]]"
+          },
+          "volatile": {
+            "type": "boolean",
+            "description": "true if this is a STATE that goes stale and should be replaced by a later write (a rate, a plan); false/omitted for an EVENT, which is append-only. Recorded and returned by recall; supersession is still an explicit act, not automatic"
+          },
+          "as_of": {
+            "type": "string",
+            "description": "when this was true (ISO date), if that differs from when it was written"
+          }
+        },
+        "required": [
+          "oldId",
+          "title",
+          "body"
+        ]
+      }
+    },
+    {
+      "name": "forget",
+      "readonly": false,
+      "crossStar": false,
+      "scopeGuarded": false,
+      "tiers": [
+        "home",
+        "org",
+        "edge"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "id of the item to forget (out_memory/...)"
+          },
+          "proposalId": {
+            "type": "string",
+            "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+            "description": "ULID naming this request (ADR-0010, edge only): a retry reuses it, a new request takes a new one; with it the answer is {proposalId, status, reason?, currentHash?, writtenHash?}"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "put_page",
+      "readonly": false,
+      "crossStar": false,
+      "scopeGuarded": false,
+      "tiers": [
+        "edge"
+      ],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "vault-relative page path under the star's memory directory, ending .md"
+          },
+          "content": {
+            "type": "string",
+            "maxLength": 100000,
+            "description": "the whole file: frontmatter and body"
+          },
+          "base": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "sha256 of the whole file its sender saw; absent = create-once"
+          },
+          "proposalId": {
+            "type": "string",
+            "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+            "description": "ULID naming this request (ADR-0010, edge only): a retry reuses it, a new request takes a new one; with it the answer is {proposalId, status, reason?, currentHash?, writtenHash?}"
+          }
+        },
+        "required": [
+          "path",
+          "content",
+          "proposalId"
+        ]
+      }
+    }
+  ],
+  "ceilings": {
+    "home": [
+      "recall",
+      "page",
+      "indexed_page",
+      "health",
+      "tree",
+      "neighbors",
+      "graph",
+      "hotlist",
+      "remember",
+      "supersede",
+      "forget"
+    ],
+    "home off loopback": [
+      "recall",
+      "indexed_page",
+      "health",
+      "hotlist",
+      "remember"
+    ],
+    "cross-star": [
+      "recall",
+      "indexed_page",
+      "health",
+      "hotlist"
+    ],
+    "org": [
+      "recall",
+      "page",
+      "indexed_page",
+      "health",
+      "remember",
+      "supersede",
+      "forget"
+    ],
+    "edge": [
+      "recall",
+      "page",
+      "indexed_page",
+      "health",
+      "forget",
+      "put_page"
+    ]
+  }
+}

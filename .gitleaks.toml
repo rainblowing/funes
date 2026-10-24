@@ -1,0 +1,12 @@
+# PLAN-0.5.0 item 45 — the edge bearer (ADR-0014): `funes_` + 32 random bytes base64url (43 chars).
+# Read by /ship's gate (`gitleaks git --staged`, from the repo root) and by CI's gitleaks-action.
+# The trailing class keeps a longer funes_ identifier from matching; group 1 is the token itself.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "funes-edge-token"
+description = "funes edge bearer token"
+regex = '''(funes_[A-Za-z0-9_-]{43})(?:[^A-Za-z0-9_-]|$)'''
+secretGroup = 1
+keywords = ["funes_"]

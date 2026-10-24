@@ -1,0 +1,13 @@
+-- Sanctioned operator statement 1 of 3 (record 24 §4; ADR-0010 §Revision "The edge apply").
+-- Abandon a pending apply journal that can never finish (a lasting R2 fault, or a row R2 refuses).
+-- Run once, in Data Studio on the STAR namespace, in the object named by the star key (ADR-0024),
+-- after `health` at /mcp/<key> has shown `applyState: pending`
+-- for long enough that you have decided it will not clear. Replace JOURNAL_ID with the row's id
+-- (`select id, proposal_id, created_at from apply_journal where state = 'pending'`); unedited, the
+-- statement fails.
+--
+-- The next hold turns the row into a `conflict` (counted by health.conflicts), re-indexes its pages
+-- from R2 as they are, and writes no receipt. Canon keeps whatever prefix landed; repair the page with
+-- a put_page from the replica. A frame mid-recovery stops at its next fence.
+-- Never edit apply_journal or receipts any other way: recovery trusts journal rows.
+UPDATE apply_journal SET state = 'abandoned' WHERE id = JOURNAL_ID AND state = 'pending';

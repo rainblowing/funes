@@ -1,0 +1,18 @@
+{
+  "text": "funes conformance fixture: цели по фитнесу, protein, 42.",
+  "signature": "Xenova/multilingual-e5-small:384:rev=761b726dd34fb83930e26aab4e9ac3899aa1fa78:dt=q8:pool=mean:trunc=2000:fwd=1:plat=linux:arch=x64:isa=avx2:ort=1.30.0",
+  "dim": 384,
+  "sha256": "f0925834fb0d3966789dfb1c04ae592180f31aae7b0e5d901d26fa038b23334a",
+  "vector": "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",
+  "recordedOn": {
+    "platform": "linux/x64",
+    "isa": "avx2",
+    "flags": "fpu tsc de cx8 apic sep cmov pat pse36 clflush mmx fxsr sse sse2 syscall nx lm rep_good nopl pni cpuid pclmulqdq ssse3 cx16 sse4_1 popcnt sse4_2 aes lahf_lm movbe fma avx f16c rdrand bmi1 avx2 bmi2",
+    "cpu": "VirtualApple @ 2.50GHz",
+    "bun": "1.4.2",
+    "onnxruntime": {
+      "common": "1.30.0",
+      "node": "1.30.0"
+    }
+  }
+}

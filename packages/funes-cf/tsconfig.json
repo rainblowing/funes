@@ -1,0 +1,18 @@
+{
+  // The Worker's own typecheck: workers-types, not @types/bun (the root tsconfig excludes this
+  // package). config.node.ts and vitest.config.ts run in Node and are checked by vitest only.
+  "compilerOptions": {
+    "lib": ["ESNext"],
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types", "node"],
+    "module": "ESNext",
+    "target": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["src", "probe", "test/**/*.workerd.ts", "test/env.d.ts", "test/local-endpoint.entry.ts", "test/fake-ai.ts"]
+}

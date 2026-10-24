@@ -1,0 +1,30 @@
+{
+  "name": "funes-engine",
+  "version": "0.6.2",
+  "description": "The funes node host: the CLI, stdio MCP, `funes serve`, reindex, publication, the libSQL adapter, E5, the funes home and the write lock. The kernel is funes-core (ADR-0022).",
+  "type": "module",
+  "sideEffects": false,
+  "module": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.1",
+    "@modelcontextprotocol/client": "^2.3.1",
+    "@modelcontextprotocol/server": "^2.3.1",
+    "@tursodatabase/database": "0.8.3",
+    "funes-core": "workspace:*",
+    "graphology": "^0.26.0",
+    "graphology-communities-louvain": "^2.0.2",
+    "graphology-layout": "^0.6.1",
+    "graphology-layout-forceatlas2": "^0.10.1",
+    "libsql": "^0.5.29",
+    "yaml": "^2.9.1"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/picomatch": "^4.0.3",
+    "picomatch": "4.0.7"
+  }
+}

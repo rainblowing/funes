@@ -1,0 +1,62 @@
+// `funes-core/internal` (RAI-313, RAI-315): the host-only kernel symbols that funes-engine and
+// funes-cf share. Not contract: no consumer imports it (lint:dag lets only funes-engine and funes-cf).
+// Every kernel export that is not on the `funes-core` entry is here, once.
+export { UNKNOWN_ACTOR, grantCoversStar, grantFor, validateAccessPolicy } from "./actor.ts";
+export { contractState } from "./contract-state.ts";
+export type { ContractSource, ContractState } from "./contract-state.ts";
+export { CROCKFORD, FunesStore, okfWrite, refusal, sha256Hex, starConfigFromText, ulidTime } from "./funes-store.ts";
+export type { FunesStoreOpts, Receipt, Receipts, RefusalReason, StarConfig } from "./funes-store.ts";
+export { GENERATION_VERSION, PARSER_VERSION, canonicalFrontmatter, encodeGeneration, generationRecord, hashItem, normalizeGenerationPath } from "./generation.ts";
+export type { GenerationInputs, GenerationRecord } from "./generation.ts";
+export { PRESETS, grantRow, validateGrants } from "./grant-row.ts";
+export type { GrantRow, Role } from "./grant-row.ts";
+export { lstatVersion, parseLstatVersion } from "./lstat-version.ts";
+export type { LstatTriple } from "./lstat-version.ts";
+export { OKF_PIN, metaFromData, obsidianYaml, okfFloor, textToItemWithMeta } from "./markdown.ts";
+export type { Normalized, OkfEdit, OkfRefusal } from "./markdown.ts";
+export { serialize } from "./mutex.ts";
+export type { Serialize } from "./mutex.ts";
+export { MAX_BODY_CHARS, MAX_TITLE_CHARS, NOT_GRANTED, assertGrantedStar, buildToolDefs, contractEntry, createRegistry, operations, toolText } from "./ops.ts";
+export type { FolderPart, JsonSchemaKeywords, JsonValue, McpToolDef, OpCapability, OpInputSchema } from "./ops.ts";
+export { isItemPath } from "./page-id.ts";
+export { BM25_COLUMN_WEIGHTS, DISTILL_WEIGHT, ENTITY_BOOST, RRF_TIE_EPS, TRUST_WEIGHT, ZONE_WEIGHT, collapseDuplicates, entityAdjust, ftsTerms, rankRecall, recencyTiebreak, trustAdjust, zoneAdjust } from "./ranking.ts";
+export type { TieMeta } from "./ranking.ts";
+export { planWhere, recallDeclarationFromText, servedDeclaration } from "./recall-planner.ts";
+export type { RecallDeclarationRead, Where } from "./recall-planner.ts";
+export { indexedFileExclude, referenceMaps, resolveEdgeTargets, statParity, vaultChangedSince } from "./reindex.ts";
+export type { Freshness, FreshnessBasis } from "./reindex.ts";
+export { MAX_CHARS, sanitizeText } from "./sanitize.ts";
+export { canonicalizeScopeExcludes } from "./scope-hash.ts";
+export { CONFIGLESS_EXCLUDES, PICOMATCH_OPTS, anyExclude, buildScopeExclude, configlessExclude, corpusOf, crossStarExpectation, crossStarHashOf, ownStarExpectation, scopeExcludesFromText } from "./scope.ts";
+export type { ScopeExcludesResult, ScopeSource } from "./scope.ts";
+export { RANKING_VERSION, servingSignature } from "./serving-signature.ts";
+export { DEFAULT_STAR_CAPABILITIES, noIdentity, starIdentityFromText, UNPARSED } from "./star-identity.ts";
+export type { StarCapabilities, StarIdentity } from "./star-identity.ts";
+export { trustDefaultOfFile } from "./vault.ts";
+export { FUNES_VERSION } from "./version.ts";
+export { assertWriteAllowed, designationFor, normalizeDesignation, notWriteLocus, validLocus, writeAllowed } from "./write-designation.ts";
+export type { WriteDesignation } from "./write-designation.ts";
+export { frontmatterFor, memoryId, memoryPageText, patchedPageText, slugify } from "./write.ts";
+// RAI-315: kernel symbols the Library does not list (no consumer outside funes names them).
+export type { MemoryItem, MemoryEdge, RecallQuery, RecallResult, RememberResult, Store, MemoryMeta, RememberInput, RememberManyResult, MemoryStore, ScopeSignature, FinalizeReindex, PageStat, PageStatRecord, PageSwap, ScalarFrontmatter, OkfCounts, EmbedderId } from "./types.ts";
+export { isTombstoned, embeddingSignature } from "./types.ts";
+export { rrf, rrfScores, DEFAULT_RRF_K } from "./rrf.ts";
+export { matchesFilter } from "./filter.ts";
+export type { RecallFilter, FilterClause, FilterCondition, FilterScalar } from "./filter.ts";
+export { parseCanonicalKey, isCanonicalKey, sameStar, mayClaimIndex, ownerClaimRefused, MAX_WORKNAME_DEPTH } from "./star-uri.ts";
+export type { StarUri, StarUriRejection, ParseStarUriResult, ParseCanonicalKeyResult } from "./star-uri.ts";
+export { buildGraphArm, GRAPH_ARM_CAP_OUT } from "./graph-arm.ts";
+export type { GraphArmInput, GraphNeighborRow } from "./graph-arm.ts";
+export { CHUNK_SIZE, CHUNK_OVERLAP, MAX_CHUNKS_PER_PAGE, CHUNK_SIG, chunkText } from "./chunking.ts";
+export { scopeRefusalReason, guardRefusal, expectationRefusal } from "./scope-guard.ts";
+export type { ScopeExpectation } from "./scope-guard.ts";
+export type { FreshnessFields, GraphNode, GraphEdge, GraphArtifact, GraphAuditRows, IndexedPage, NeighborsResult, GuardedResult, ServingIndex, ContentIdentity } from "./index-store.ts";
+export { isB64Token } from "./presented-token.ts";
+export type { PresentedToken } from "./presented-token.ts";
+export { isPagePath, historyPath, assertWritable, listedPage, pathOrder, zoneOfDir, zoneOfFile } from "./vault.ts";
+// RAI-314 (ADR-0023): the one index module, its dialects and the build walk.
+export { DO_SQLITE_DIALECT, FTS5, LIBSQL_DIALECT, ORG_DIALECT, ORG_SLOTS, SCHEMA_VERSIONS, SqlIndex, TURSO_DIALECT, countOkf, opId, slotTables } from "./sql-index.ts";
+export { RowVault } from "./row-vault.ts";
+export type { Backend, BuildInput, BuildResult, Dialect, IndexOp, IndexRow, LexicalArm, Slot, SqlExec, SqlIndexOpts, SqlValue } from "./sql-index.ts";
+export type { Vault, VaultTx, VaultPath, Version, VaultFile, VaultEntry, SwapResult, Zone } from "./vault.ts";
+export type { RecallDeclaration, RecallDeclarationResult, Condition, Predicate, Scalar } from "./recall-declaration.ts";
